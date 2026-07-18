@@ -78,6 +78,34 @@ Berlin2CD operation parser to RESET, READID, STATUS and this exact ONFI read. It
 also reports the ONFI reliability fields needed to compare the chip's ECC
 requirements with Valve's configuration before page access is implemented.
 
+The hardened hardware run reported `ecc-bits-per-512=255`, three parameter-page
+copies and a 48-byte extended parameter page. In ONFI this `0xff` ECC value is
+not a strength: it directs the host to the ECC information block in the
+extended page. The reported decimal endurance value `771` was likewise the raw
+encoded bytes `03 03`, meaning 3 x 10^3 cycles.
+
+Linux then printed `Failed to detect ONFI extended param page` because the
+probe-only filter correctly rejected the core's CHANGE READ COLUMN operation.
+Patch `0005-mtd-nand-read-berlin2cd-onfi-extended-parameters.patch` permits only
+the operation required by this confirmed geometry: `RNDOUT`, column `0x0300`,
+`RNDOUTSTART`, and exactly 48 input bytes. It validates the extended CRC and
+`EPPS` signature and logs the ECC strength and codeword size. The operation is
+still PIO-only and identification-only; ordinary NAND page access remains
+blocked.
+
+Expected new output includes:
+
+```text
+ONFI reliability: ecc=extended-parameter-page ... block-endurance=3 x 10^3 cycles ... extended-page-bytes=48
+ONFI extended parameter data (48 bytes): ...
+ONFI extended parameter CRC: calculated=.... expected=.... (valid), signature="EPPS"
+ONFI extended ECC: strength=... bits step-size=... bytes ...
+```
+
+If the extended read times out, retain the named controller stage and final
+register dump. If its CRC or signature is invalid, do not broaden the operation
+filter or proceed to page reads; first compare repeated 48-byte captures.
+
 For earlier READID failures, a matching Micron result is expected to begin with
 either `2c 68 04 4a` or `2c 68 04 46`. Interpret failures as follows:
 
@@ -118,8 +146,8 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Capture the additional ONFI reliability fields and compare them with Valve's
-   48-bit-per-4-KiB BCH configuration.
+1. Validate the extended ONFI ECC strength and codeword size on hardware and
+   compare them with Valve's 48-bit-per-4-KiB BCH configuration.
 2. Port the pBridge channel/semaphore/BCM descriptor primitives with bounded
    polling and descriptor unit tests.
 3. Implement raw page reads, BCH strength programming and the vendor-compatible

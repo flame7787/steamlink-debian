@@ -1,0 +1,247 @@
+The Micron MT29F32G08CBACAWP identifies reliably and returns a valid ONFI
+parameter page, but advertises its ECC requirements through a 48-byte
+extended parameter page. The NAND core attempts to read it at column 768,
+immediately after the three standard parameter-page copies, and the
+Berlin2CD probe-only operation filter rejects that column-change command.
+
+Permit only the exact read-only sequence required by this device:
+RNDOUT, column 0x0300, RNDOUTSTART and 48 data bytes. Execute it through
+the existing NFCv2 length-override PIO path, validate the extended-page
+CRC and EPPS signature, and report the ECC section's strength and step
+size. Also decode the ONFI endurance exponent instead of printing its two
+encoded bytes as a little-endian integer.
+
+The controller remains probe-only. Ordinary page and OOB reads, MTD
+registration, DMA, erase and program operations remain unavailable.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 148 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 134 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+index 2bede0d..b041a9f 100644
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -454,6 +454,11 @@ static u16 marvell_nfc_onfi_crc16(u16 crc, const u8 *buf, size_t len)
+ 	return crc;
+ }
+ 
++#define BERLIN2CD_ONFI_PARAM_PAGES	3
++#define BERLIN2CD_ONFI_EXT_PARAM_LEN	48
++#define BERLIN2CD_ONFI_EXT_PARAM_COLUMN	\
++	(sizeof(struct nand_onfi_params) * BERLIN2CD_ONFI_PARAM_PAGES)
++
+ static inline struct marvell_nfc *to_marvell_nfc(struct nand_controller *ctrl)
+ {
+ 	return container_of(ctrl, struct marvell_nfc, controller);
+@@ -542,8 +547,10 @@ static void marvell_nfc_dump_onfi_params(struct marvell_nfc *nfc,
+ 
+ 	if (len >= sizeof(struct nand_onfi_params)) {
+ 		const struct nand_onfi_params *params = (const void *)buf;
++		u16 endurance = le16_to_cpu(params->block_endurance);
+ 		u16 expected = le16_to_cpu(params->crc);
+ 		u16 calculated = marvell_nfc_onfi_crc16(ONFI_CRC_BASE, buf, 254);
++		u16 ext_len = le16_to_cpu(params->ext_param_page_length) * 16;
+ 
+ 		dev_info(nfc->dev,
+ 			 "ONFI parameter CRC: calculated=%04x expected=%04x (%s)\n",
+@@ -567,13 +574,85 @@ static void marvell_nfc_dump_onfi_params(struct marvell_nfc *nfc,
+ 			 le32_to_cpu(params->blocks_per_lun),
+ 			 params->lun_count, params->bits_per_cell,
+ 			 params->addr_cycles);
+-		dev_info(nfc->dev,
+-			 "ONFI reliability: ecc-bits-per-512=%u bad-blocks-per-lun=%u block-endurance=%u sdr-timing-modes=%04x parameter-pages=%u\n",
+-			 params->ecc_bits, le16_to_cpu(params->bb_per_lun),
+-			 le16_to_cpu(params->block_endurance),
+-			 le16_to_cpu(params->sdr_timing_modes),
+-			 params->num_of_param_pages);
++		if (params->ecc_bits == 0xff)
++			dev_info(nfc->dev,
++				 "ONFI reliability: ecc=extended-parameter-page bad-blocks-per-lun=%u block-endurance=%u x 10^%u cycles sdr-timing-modes=%04x parameter-pages=%u extended-page-bytes=%u\n",
++				 le16_to_cpu(params->bb_per_lun),
++				 endurance & 0xff, endurance >> 8,
++				 le16_to_cpu(params->sdr_timing_modes),
++				 params->num_of_param_pages, ext_len);
++		else
++			dev_info(nfc->dev,
++				 "ONFI reliability: ecc=%u bits/512 bytes bad-blocks-per-lun=%u block-endurance=%u x 10^%u cycles sdr-timing-modes=%04x parameter-pages=%u extended-page-bytes=%u\n",
++				 params->ecc_bits,
++				 le16_to_cpu(params->bb_per_lun),
++				 endurance & 0xff, endurance >> 8,
++				 le16_to_cpu(params->sdr_timing_modes),
++				 params->num_of_param_pages, ext_len);
++	}
++}
++
++static void marvell_nfc_dump_onfi_ext_params(struct marvell_nfc *nfc,
++					     const struct nand_subop *subop,
++					     struct marvell_nfc_op *nfc_op)
++{
++	const struct nand_op_instr *instr = nfc_op->data_instr;
++	unsigned int op_id = nfc_op->data_instr_idx;
++	unsigned int len = nand_subop_get_data_len(subop, op_id);
++	unsigned int offset = nand_subop_get_data_start_off(subop, op_id);
++	const u8 *buf = instr->ctx.data.buf.in + offset;
++	const struct onfi_ext_param_page *params = (const void *)buf;
++	const u8 *cursor, *end = buf + len;
++	u16 calculated, expected;
++	unsigned int i;
++
++	dev_info(nfc->dev, "ONFI extended parameter data (%u bytes): %*ph\n",
++		 len, (int)len, buf);
++
++	if (len < sizeof(*params))
++		return;
++
++	expected = le16_to_cpu(params->crc);
++	calculated = marvell_nfc_onfi_crc16(ONFI_CRC_BASE, buf + 2, len - 2);
++	dev_info(nfc->dev,
++		 "ONFI extended parameter CRC: calculated=%04x expected=%04x (%s), signature=\"%.*s\"\n",
++		 calculated, expected,
++		 calculated == expected ? "valid" : "invalid",
++		 (int)sizeof(params->sig), params->sig);
++	if (calculated != expected || memcmp(params->sig, "EPPS", 4))
++		return;
++
++	cursor = (const u8 *)(params + 1);
++	for (i = 0; i < ARRAY_SIZE(params->sections); i++) {
++		const struct onfi_ext_section *section = &params->sections[i];
++		unsigned int section_len = section->length * 16;
++
++		if (section->type == ONFI_SECTION_TYPE_2) {
++			const struct onfi_ext_ecc_info *ecc = (const void *)cursor;
++			u16 endurance;
++
++			if (sizeof(*ecc) > end - cursor ||
++			    !ecc->codeword_size || ecc->codeword_size >= 31) {
++				dev_warn(nfc->dev,
++					 "ONFI extended ECC section is truncated or invalid\n");
++				return;
++			}
++
++			endurance = le16_to_cpu(ecc->block_endurance);
++			dev_info(nfc->dev,
++				 "ONFI extended ECC: strength=%u bits step-size=%u bytes bad-blocks-per-lun=%u block-endurance=%u x 10^%u cycles\n",
++				 ecc->ecc_bits, 1U << ecc->codeword_size,
++				 le16_to_cpu(ecc->bb_per_lun),
++				 endurance & 0xff, endurance >> 8);
++			return;
++		}
++
++		if (section_len > end - cursor)
++			break;
++		cursor += section_len;
+ 	}
++
++	dev_warn(nfc->dev, "ONFI extended parameter page has no ECC section\n");
+ }
+ 
+ /*
+@@ -1915,6 +1994,8 @@ static int marvell_nfc_monolithic_access_exec(struct nand_chip *chip,
+ {
+ 	struct marvell_nfc_op nfc_op;
+ 	struct marvell_nfc *nfc = to_marvell_nfc(chip->controller);
++	const char *onfi_label = NULL;
++	bool onfi_ext_params;
+ 	bool onfi_params;
+ 	bool reading;
+ 	int ret;
+@@ -1923,10 +2004,18 @@ static int marvell_nfc_monolithic_access_exec(struct nand_chip *chip,
+ 	onfi_params = nfc->caps->probe_only &&
+ 		      subop->instrs[0].type == NAND_OP_CMD_INSTR &&
+ 		      subop->instrs[0].ctx.cmd.opcode == NAND_CMD_PARAM;
+-	reading = (nfc_op.data_instr->type == NAND_OP_DATA_IN_INSTR);
++	onfi_ext_params = nfc->caps->probe_only &&
++			  subop->instrs[0].type == NAND_OP_CMD_INSTR &&
++			  subop->instrs[0].ctx.cmd.opcode == NAND_CMD_RNDOUT;
+ 	if (onfi_params)
++		onfi_label = "ONFI parameter";
++	else if (onfi_ext_params)
++		onfi_label = "ONFI extended parameter";
++	reading = (nfc_op.data_instr->type == NAND_OP_DATA_IN_INSTR);
++	if (onfi_label)
+ 		dev_info(nfc->dev,
+-			 "ONFI parameter command: NDCR=%08x NDSR=%08x NDCB=%08x %08x %08x %08x\n",
++			 "%s command: NDCR=%08x NDSR=%08x NDCB=%08x %08x %08x %08x\n",
++			 onfi_label,
+ 			 readl_relaxed(nfc->regs + NDCR),
+ 			 readl_relaxed(nfc->regs + NDSR), nfc_op.ndcb[0],
+ 			 nfc_op.ndcb[1], nfc_op.ndcb[2], nfc_op.ndcb[3]);
+@@ -1955,24 +2044,33 @@ static int marvell_nfc_monolithic_access_exec(struct nand_chip *chip,
+ 
+ 	ret = marvell_nfc_xfer_data_pio(chip, subop, &nfc_op);
+ 	if (ret) {
+-		if (onfi_params)
++		if (onfi_label)
+ 			marvell_nfc_dump_probe_regs(nfc,
+-						    "ONFI parameter PIO failed");
++					onfi_ext_params ?
++					"ONFI extended parameter PIO failed" :
++					"ONFI parameter PIO failed");
+ 		return ret;
+ 	}
+ 	if (onfi_params)
+ 		marvell_nfc_dump_onfi_params(nfc, subop, &nfc_op);
++	else if (onfi_ext_params)
++		marvell_nfc_dump_onfi_ext_params(nfc, subop, &nfc_op);
+ 
+ 	ret = marvell_nfc_wait_cmdd(chip);
+ 	if (ret) {
+-		if (onfi_params)
++		if (onfi_label)
+ 			marvell_nfc_dump_probe_regs(nfc,
+-						    "ONFI parameter read failed");
++					onfi_ext_params ?
++					"ONFI extended parameter read failed" :
++					"ONFI parameter read failed");
+ 		return ret;
+ 	}
+ 
+-	if (onfi_params)
+-		marvell_nfc_dump_probe_regs(nfc, "ONFI parameter read complete");
++	if (onfi_label)
++		marvell_nfc_dump_probe_regs(nfc,
++			onfi_ext_params ?
++			"ONFI extended parameter read complete" :
++			"ONFI parameter read complete");
+ 
+ 	cond_delay(nfc_op.data_delay_ns);
+ 
+@@ -2310,6 +2408,14 @@ static const struct nand_op_parser marvell_nfcv1_op_parser = NAND_OP_PARSER(
+ 	);
+ 
+ static const struct nand_op_parser marvell_berlin2cd_op_parser = NAND_OP_PARSER(
++	/* Read the ECC section from the extended ONFI parameter page. */
++	NAND_OP_PARSER_PATTERN(
++		marvell_nfc_monolithic_access_exec,
++		NAND_OP_PARSER_PAT_CMD_ELEM(false),
++		NAND_OP_PARSER_PAT_ADDR_ELEM(false, 2),
++		NAND_OP_PARSER_PAT_CMD_ELEM(false),
++		NAND_OP_PARSER_PAT_DATA_IN_ELEM(false,
++					     BERLIN2CD_ONFI_EXT_PARAM_LEN)),
+ 	/* Identification-only ONFI parameter-page read. */
+ 	NAND_OP_PARSER_PATTERN(
+ 		marvell_nfc_monolithic_access_exec,
+@@ -2367,6 +2473,20 @@ marvell_berlin2cd_ident_op_supported(const struct nand_operation *op)
+ 		       instrs[3].ctx.data.len ==
+ 					     sizeof(struct nand_onfi_params) &&
+ 		       instrs[3].ctx.data.force_8bit;
++	case NAND_CMD_RNDOUT:
++		return op->ninstrs == 4 &&
++		       instrs[1].type == NAND_OP_ADDR_INSTR &&
++		       instrs[1].ctx.addr.naddrs == 2 &&
++		       instrs[1].ctx.addr.addrs[0] ==
++					(BERLIN2CD_ONFI_EXT_PARAM_COLUMN & 0xff) &&
++		       instrs[1].ctx.addr.addrs[1] ==
++					(BERLIN2CD_ONFI_EXT_PARAM_COLUMN >> 8) &&
++		       instrs[2].type == NAND_OP_CMD_INSTR &&
++		       instrs[2].ctx.cmd.opcode == NAND_CMD_RNDOUTSTART &&
++		       instrs[3].type == NAND_OP_DATA_IN_INSTR &&
++		       instrs[3].ctx.data.len ==
++					BERLIN2CD_ONFI_EXT_PARAM_LEN &&
++		       instrs[3].ctx.data.force_8bit;
+ 	default:
+ 		return false;
+ 	}
+-- 
+2.50.1
