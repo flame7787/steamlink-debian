@@ -178,6 +178,34 @@ submit descriptors, or read NAND pages. After boot, capture those two lines and
 repeat the clock, interrupt and driver-binding checks. The pBridge clock should
 then show one enabled consumer owned by `f7f00000.nand-controller`.
 
+Hardware produced the following inherited state:
+
+```text
+passive pBridge status: clock=212500000 Hz sem-empty=ffffffff sem-full=00003000 dHub-busy=00000000 dHub-pending=00000000
+passive pBridge control: bus-reset-enable=00000000 bus-reset-done=00000000 BCM-error=00000000 BCM-base=f0000000
+```
+
+The dHub is idle, no reset or BCM error is active, and the BCM aperture matches
+Valve's expected high address bits for NFC at `0xf7f00000`. Bits 12 and 13 in
+the full-condition latch correspond to Valve's NFC command and NFC data
+handshake semaphores. The empty/full registers are write-one-to-clear condition
+latches, not direct semaphore counters, so the apparently overlapping values
+are not contradictory.
+
+Patch `0007-mtd-nand-inventory-berlin2cd-pbridge-queries.patch` now reads the
+documented query windows for dHub channels 0 through 3, their eight HBO queues,
+and NFC-related semaphores 0-3, 12, 13, 19, 24 and 25. It reports producer and
+consumer counts and pointers without modifying them. Channel configuration,
+FIFO base/depth, semaphore depth and interrupt-mask registers are intentionally
+excluded because the vendor register specification marks them write-only.
+
+Retrieve the complete early output from the journal if the 16 KiB kernel ring
+buffer has wrapped:
+
+```sh
+sudo journalctl -k -b --no-pager | grep -E 'passive pBridge|READID'
+```
+
 The probe patch treats Berlin2CD as NFCv2 for timing and register capabilities,
 but deliberately uses the explicit NFCv1 command parser for READID and RESET.
 It also has a dedicated identification-only cleanup path, since the ordinary
@@ -185,18 +213,19 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot the passive pBridge patch and record the untouched semaphore, dHub,
-   reset and BCM state.
-2. Port the pBridge channel/semaphore/BCM descriptor primitives with bounded
+1. Boot patch `0007` and record all channel, queue and semaphore query results.
+2. Decide whether the inherited pBridge state can be reused or needs a bounded
+   reset and explicit Valve-compatible initialization.
+3. Port the pBridge channel/semaphore/BCM descriptor primitives with bounded
    polling, but initially execute only a read-only READID transfer.
-3. Implement repeated raw page reads with BCH disabled and explicitly test
+4. Implement repeated raw page reads with BCH disabled and explicitly test
    randomizer behavior before decoding production data.
-4. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
+5. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
    raw captures before registering any MTD.
-5. Register a read-only MTD and validate full-device hashes, bad-block markers
+6. Register a read-only MTD and validate full-device hashes, bad-block markers
    and ECC statistics.
-6. Add read-retry support if the confirmed ID requires it.
-7. Put erase/program support behind an explicit Kconfig opt-in, then test only
+7. Add read-retry support if the confirmed ID requires it.
+8. Put erase/program support behind an explicit Kconfig opt-in, then test only
    on disposable blocks after verified USB recovery.
 
 GPU work is separate. Etnaviv is already upstream in modern Linux and the GC1000
