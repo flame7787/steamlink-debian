@@ -3,6 +3,9 @@
 set -euo pipefail
 
 IMAGE=steamlink-debian.img
+IMAGE_SIZE=$((1024 * 1024 * 1024))
+PARTITION_OFFSET=$((1024 * 1024))
+PARTITION_SIZE=$((IMAGE_SIZE - PARTITION_OFFSET))
 MOUNT_DIR=""
 LOOP_DEV=""
 
@@ -30,19 +33,25 @@ cleanup() {
 trap cleanup EXIT
 
 # A sparse file avoids writing 1 GiB of zeros before partitioning.
-truncate -s 1G "$IMAGE"
+truncate -s "$IMAGE_SIZE" "$IMAGE"
 
 # Create an MBR partition table with one ext3 partition.
 parted --script "$IMAGE" mklabel msdos
 parted --script "$IMAGE" mkpart primary ext3 1MiB 100%
 
 # Use a private mount point so concurrent or interrupted builds do not share
-# persistent state under /mnt.
+# persistent state under /mnt. Map the partition contents directly instead of
+# relying on losetup -P to create a loopXp1 device. Some runners return the
+# parent loop device before its partition node exists, while this fixed offset
+# exactly matches the MBR partition created above.
 MOUNT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/steamlink-rootfs.XXXXXX")
-LOOP_DEV=$(losetup --show -P -f "$IMAGE")
+LOOP_DEV=$(losetup --find --show \
+	--offset "$PARTITION_OFFSET" \
+	--sizelimit "$PARTITION_SIZE" \
+	"$IMAGE")
 
-mkfs.ext3 "${LOOP_DEV}p1"
-mount "${LOOP_DEV}p1" "$MOUNT_DIR"
+mkfs.ext3 "$LOOP_DEV"
+mount "$LOOP_DEV" "$MOUNT_DIR"
 tar -xpf rootfs.tar -C "$MOUNT_DIR"
 rm -f "$MOUNT_DIR/.dockerenv"
 
