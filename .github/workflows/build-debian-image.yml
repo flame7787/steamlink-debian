@@ -18,14 +18,17 @@ on:
 jobs:
   build-kernel:
     runs-on: [self-hosted, linux, x64, watermelon]
-    container: debian:bookworm-slim
     timeout-minutes: 30
     permissions:
       contents: read
 
     steps:
       - name: Install dependencies
-        run: apt-get update && apt-get install -y --no-install-recommends bash ca-certificates git tar xz-utils wget patch build-essential flex bison libssl-dev libelf-dev bc kmod
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bash ca-certificates git tar xz-utils wget patch ccache \
+            build-essential flex bison libssl-dev libelf-dev bc kmod
 
       - name: Checkout repository
         uses: actions/checkout@v2

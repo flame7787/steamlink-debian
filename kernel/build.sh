@@ -10,6 +10,12 @@ cd steamlink-sdk
 source setenv.sh
 cd ../linux-$KERNEL_VERSION
 
+MAKE_ARGS=()
+if command -v ccache >/dev/null 2>&1; then
+	MAKE_ARGS+=("CC=ccache ${CROSS_COMPILE}gcc")
+	echo "Using ccache for kernel compilation"
+fi
+
 PATCH_DIR="$REPO_ROOT/kernel/patches/$KERNEL_VERSION"
 if [[ -d "$PATCH_DIR" ]]; then
 	shopt -s nullglob
@@ -26,9 +32,13 @@ if [[ -d "$PATCH_DIR" ]]; then
 	done
 fi
 
-make olddefconfig
-make -j$(nproc)
-make modules
+make "${MAKE_ARGS[@]}" olddefconfig
+make "${MAKE_ARGS[@]}" -j"$(nproc)"
+make "${MAKE_ARGS[@]}" modules
 rm -rf /tmp/build-modules
 mkdir -p /tmp/build-modules
-INSTALL_MOD_PATH=/tmp/build-modules make modules_install
+INSTALL_MOD_PATH=/tmp/build-modules make "${MAKE_ARGS[@]}" modules_install
+
+if command -v ccache >/dev/null 2>&1; then
+	ccache --show-stats
+fi
