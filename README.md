@@ -1,7 +1,6 @@
-## fork
+## What is this fork?
 
 The build uses Debian 13 and Linux 6.1.115. Docker is included in the generated image. The kernel config adds Linux namespaces, cgroups, seccomp, overlayfs, veth/bridge networking, nftables, and iptables, required for Docker.
-
 
 # steamlink-debian
 
@@ -30,7 +29,7 @@ debian@steamlink:~$ fastfetch
 
 ## How to use
 
-Download an image of Debian version of your choice from the [Releases](https://github.com/djmuted/steamlink-debian/releases) page and flash it on a 2GB (or bigger) USB stick using [balenaEtcher](https://etcher.balena.io/) or any other USB flasher. SD cards paired with a USB SD Reader work as well.
+Download an image of Debian version of your choice from the [Releases](https://github.com/flame7787/steamlink-debian/releases) page and flash it on a 2GB (or bigger) USB stick using [balenaEtcher](https://etcher.balena.io/) or any other USB flasher. SD cards paired with a USB SD Reader work as well.
 
 > :warning: **Warning**: Flashing the image on the USB stick will wipe all data stored on the device!
 
@@ -49,15 +48,6 @@ password: `steamlink`
 
 For the first boot a LAN connection is required. Once the new kernel starts booting, there will be no HDMI output anymore. Connect to the Steam Link via SSH. Local IP address can be found in your router's DHCP table.
 
-### Change hostname
-
-This the first thing you should do after logging in, some commands might not work without a proper hostname.
-
-```bash
-sudo hostnamectl set-hostname steamlink
-echo '127.0.0.1 steamlink' | sudo tee -a /etc/hosts
-```
-
 ### Resize root partition to full disk size
 
 Resize the partition to take the entire space:
@@ -74,16 +64,27 @@ sudo resize2fs /dev/sda1
 
 This might take a while, depending on your disk size.
 
-## What does not work
+## Working
+
+TODO
+
+## Work in progress
 
 - NAND driver
 - DMA controller
+
+## Planned
+
 - video/audio output
+
+## Currently neglected/broken
+
 - suspend/resume/halt/reboot
 - RTC
 
 ## Credits
 
+- Forked from [djmuted/steamlink-debian](https://github.com/djmuted/steamlink-debian) GitHub repository
 - [Getting Linux on Valve Steam Link from heap.ovh](https://heap.ovh/getting-linux-on-valve-steam-link.html)
 - [Docker Debian bootstrap script from v86 project](https://github.com/copy/v86)
-- [regmibijay/steamlink-archlinux GitHub repository](https://github.com/regmibijay/steamlink-archlinux)
+- [regmibijay/steamlink-archlinux](https://github.com/regmibijay/steamlink-archlinux) GitHub repository

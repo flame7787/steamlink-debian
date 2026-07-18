@@ -21,9 +21,14 @@ RUN set -eux; \
         openssh-server sudo ifupdown net-tools iproute2 iptables nftables \
         kmod udev iputils-ping wget dosfstools unzip binutils libatomic1 \
         initramfs-tools e2fsprogs parted firmware-libertas wireless-regdb \
-        docker.io; \
+        docker.io locales; \
+    sed -i 's/^# *\(en_US.UTF-8 UTF-8\)/\1/' /etc/locale.gen; \
+    locale-gen; \
+    update-locale LANG=en_US.UTF-8; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8
 
 COPY ./rootfs/boot/* /boot/
 COPY ./rootfs/etc/ /etc/
