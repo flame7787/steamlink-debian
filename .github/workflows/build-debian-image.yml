@@ -14,6 +14,14 @@ on:
         description: "Debian version to use"
         required: true
         default: "trixie"
+      build_mode:
+        description: "Build the kernel only or produce a complete disk image"
+        required: true
+        type: choice
+        default: "full"
+        options:
+          - "full"
+          - "kernel-only"
 
 jobs:
   build-kernel:
@@ -24,14 +32,30 @@ jobs:
 
     steps:
       - name: Install dependencies
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bash ca-certificates git tar xz-utils wget patch ccache \
+          echo "KERNEL_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
+          packages=(
+            bash ca-certificates git tar xz-utils wget patch ccache
             build-essential flex bison libssl-dev libelf-dev bc kmod
+          )
+          missing=()
+          for package in "${packages[@]}"; do
+            if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
+              missing+=("$package")
+            fi
+          done
+
+          if ((${#missing[@]})); then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          else
+            echo "All kernel build dependencies are already installed."
+          fi
 
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
         with:
           submodules: "true"
 
@@ -47,7 +71,11 @@ jobs:
       - name: Build Kernel
         env:
           KERNEL_VERSION: ${{ inputs.kernel_version }}
-        run: ./kernel/build.sh
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          ./kernel/build.sh
+          echo "KERNEL_BUILD_SECONDS=$(( $(date +%s) - started_at ))" >> "$GITHUB_ENV"
 
       - name: Prepare Artifacts
         working-directory: linux-${{ inputs.kernel_version }}
@@ -60,59 +88,114 @@ jobs:
           rm -rf ../boot/${{ inputs.kernel_version }}-steam/source
 
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kernel-${{ inputs.kernel_version }}-steam
           path: boot/
 
+      - name: Record kernel timing
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          elapsed=$(( $(date +%s) - KERNEL_JOB_STARTED_AT ))
+          {
+            echo "### Kernel build"
+            echo "- Mode: \`${{ inputs.build_mode }}\`"
+            echo "- Kernel compile: ${KERNEL_BUILD_SECONDS:-not completed} seconds"
+            echo "- Kernel job elapsed: ${elapsed} seconds"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build-rootfs:
     runs-on: [self-hosted, linux, x64, watermelon]
     needs: build-kernel
+    if: ${{ inputs.build_mode == 'full' }}
     steps:
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bash parted xz-utils
+        shell: bash
+        run: |
+          echo "ROOTFS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
+          packages=(bash parted xz-utils)
+          missing=()
+          for package in "${packages[@]}"; do
+            if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
+              missing+=("$package")
+            fi
+          done
+
+          if ((${#missing[@]})); then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          else
+            echo "All rootfs build dependencies are already installed."
+          fi
 
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
         with:
           submodules: "false"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
+        with:
+          name: steamlink-builder
+          keep-state: true
+          cleanup: false
 
-      - uses: actions/download-artifact@master
+      - name: Download kernel artifact
+        uses: actions/download-artifact@v8
         with:
           name: kernel-${{ inputs.kernel_version }}-steam
           path: kernel-${{ inputs.kernel_version }}
 
-      - name: Build RootFS Docker Image
-        run: docker buildx build --platform linux/arm/v7 --build-arg KERNEL_VERSION=${{ inputs.kernel_version }} --build-arg DEBIAN_VERSION=${{ inputs.debian_version }} --rm -f rootfs/Dockerfile --tag steamlink-debian:latest --output type=docker,dest=steamlink-debian.tar .
-
-      - name: Create RootFS tarball
+      - name: Build and export RootFS
+        shell: bash
         run: |
-          docker load -i steamlink-debian.tar
-          container_id=$(docker create steamlink-debian:latest)
-          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
-          docker export "$container_id" -o rootfs.tar
-
-      - name: Upload RootFS tarball
-        uses: actions/upload-artifact@v4
-        with:
-          name: steamlink-debian-${{ inputs.debian_version }}-${{ inputs.kernel_version }}-rootfs
-          path: rootfs.tar
+          started_at=$(date +%s)
+          docker buildx build \
+            --builder steamlink-builder \
+            --platform linux/arm/v7 \
+            --build-arg KERNEL_VERSION=${{ inputs.kernel_version }} \
+            --build-arg DEBIAN_VERSION=${{ inputs.debian_version }} \
+            --file rootfs/Dockerfile \
+            --output type=tar,dest=rootfs.tar \
+            .
+          echo "ROOTFS_BUILD_SECONDS=$(( $(date +%s) - started_at ))" >> "$GITHUB_ENV"
 
       - name: Create disk image
-        run: sudo ./rootfs/build.sh
+        shell: bash
+        run: |
+          started_at=$(date +%s)
+          sudo ./rootfs/build.sh
+          echo "IMAGE_BUILD_SECONDS=$(( $(date +%s) - started_at ))" >> "$GITHUB_ENV"
 
       - name: Prepare compressed disk image
         run: |
           mv steamlink-debian.img.xz steamlink-debian-${{ inputs.debian_version }}-${{ inputs.kernel_version }}.img.xz
 
       - name: Upload disk image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: steamlink-debian-${{ inputs.debian_version }}-${{ inputs.kernel_version }}-image
           path: steamlink-debian-${{ inputs.debian_version }}-${{ inputs.kernel_version }}.img.xz
+          compression-level: 0
+
+      - name: Limit persistent BuildKit cache
+        if: ${{ always() }}
+        run: docker buildx --builder steamlink-builder prune --force --max-used-space 10gb
+
+      - name: Record rootfs timing
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          elapsed=$(( $(date +%s) - ROOTFS_JOB_STARTED_AT ))
+          {
+            echo "### Rootfs and disk image"
+            echo "- Rootfs build/export: ${ROOTFS_BUILD_SECONDS:-not completed} seconds"
+            echo "- Disk image creation/compression: ${IMAGE_BUILD_SECONDS:-not completed} seconds"
+            echo "- Rootfs job elapsed: ${elapsed} seconds"
+            echo "- BuildKit cache limit: 10 GB"
+          } >> "$GITHUB_STEP_SUMMARY"

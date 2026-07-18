@@ -29,7 +29,8 @@ cleanup() {
 
 trap cleanup EXIT
 
-dd if=/dev/zero of="$IMAGE" bs=1M count=1024
+# A sparse file avoids writing 1 GiB of zeros before partitioning.
+truncate -s 1G "$IMAGE"
 
 # Create an MBR partition table with one ext3 partition.
 parted --script "$IMAGE" mklabel msdos
@@ -57,6 +58,7 @@ MOUNT_DIR=""
 losetup -d "$LOOP_DEV"
 LOOP_DEV=""
 
-# Replace an output left by an earlier run and make it artifact-readable.
-xz -f "$IMAGE"
+# Replace an output left by an earlier run, using a fast low-memory profile for
+# the small self-hosted runner, and make it artifact-readable.
+xz -T2 -1 -f "$IMAGE"
 chmod 0644 "${IMAGE}.xz"

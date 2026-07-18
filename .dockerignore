@@ -1,0 +1,6 @@
+**
+!.dockerignore
+!rootfs/
+!rootfs/**
+!kernel-*/
+!kernel-*/**
