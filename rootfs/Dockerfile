@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 ARG DEBIAN_VERSION=trixie
 FROM docker.io/arm32v7/debian:$DEBIAN_VERSION-slim
 
@@ -6,7 +7,14 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 # Keep the expensive emulated package installation independent of the kernel
 # artifact and local rootfs files so it remains cached during kernel iteration.
-RUN set -eux; \
+# Cache apt metadata and packages separately so a genuine layer rebuild does not
+# also have to download every package again.
+RUN --mount=type=cache,id=steamlink-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=steamlink-apt-archives,target=/var/cache/apt,sharing=locked \
+    set -eux; \
+    rm -f /etc/apt/apt.conf.d/docker-clean; \
+    printf '%s\n' 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
+        > /etc/apt/apt.conf.d/keep-cache; \
     components="main non-free non-free-firmware"; \
     if [ "$DEBIAN_VERSION" = "bullseye" ]; then components="main non-free"; fi; \
     rm -rf /etc/apt/sources.list.d/*; \
@@ -21,12 +29,14 @@ RUN set -eux; \
         openssh-server sudo ifupdown net-tools iproute2 iptables nftables \
         kmod udev iputils-ping wget dosfstools unzip binutils libatomic1 \
         initramfs-tools e2fsprogs parted firmware-libertas wireless-regdb \
-        docker.io locales; \
+        docker.io locales lz4
+
+# Locale generation is deliberately separate from package installation. Locale
+# policy changes no longer invalidate the slow emulated apt/dpkg layer.
+RUN set -eux; \
     sed -i 's/^# *\(en_US.UTF-8 UTF-8\)/\1/' /etc/locale.gen; \
     locale-gen; \
-    update-locale LANG=en_US.UTF-8; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
+    update-locale LANG=en_US.UTF-8
 
 ENV LANG=en_US.UTF-8
 

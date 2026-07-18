@@ -36,21 +36,18 @@ truncate -s 1G "$IMAGE"
 parted --script "$IMAGE" mklabel msdos
 parted --script "$IMAGE" mkpart primary ext3 1MiB 100%
 
-sync
-
 # Use a private mount point so concurrent or interrupted builds do not share
 # persistent state under /mnt.
 MOUNT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/steamlink-rootfs.XXXXXX")
 LOOP_DEV=$(losetup --show -P -f "$IMAGE")
 
-sync
-
 mkfs.ext3 "${LOOP_DEV}p1"
 mount "${LOOP_DEV}p1" "$MOUNT_DIR"
 tar -xpf rootfs.tar -C "$MOUNT_DIR"
 rm -f "$MOUNT_DIR/.dockerenv"
-sync
 
+# umount flushes all pending filesystem writes before it returns; global syncs
+# here only stall the runner on unrelated I/O.
 umount "$MOUNT_DIR"
 rmdir "$MOUNT_DIR"
 MOUNT_DIR=""
@@ -58,7 +55,10 @@ MOUNT_DIR=""
 losetup -d "$LOOP_DEV"
 LOOP_DEV=""
 
-# Replace an output left by an earlier run, using a fast low-memory profile for
-# the small self-hosted runner, and make it artifact-readable.
-xz -T2 -1 -f "$IMAGE"
+# Replace an output left by an earlier run. Use all available CPUs while keeping
+# xz below half of the runner's 2 GiB RAM. XZ_THREADS and XZ_MEMLIMIT remain
+# overridable for smaller development machines.
+XZ_THREADS=${XZ_THREADS:-0}
+XZ_MEMLIMIT=${XZ_MEMLIMIT:-1GiB}
+xz -T"$XZ_THREADS" -1 --memlimit-compress="$XZ_MEMLIMIT" -f "$IMAGE"
 chmod 0644 "${IMAGE}.xz"

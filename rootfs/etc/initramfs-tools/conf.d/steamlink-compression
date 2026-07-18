@@ -1,0 +1,4 @@
+# The Steam Link kernel includes CONFIG_RD_LZ4. Level 1 minimizes emulated ARM
+# CPU time during builds and also keeps decompression fast on the target.
+COMPRESS=lz4
+COMPRESSLEVEL=1

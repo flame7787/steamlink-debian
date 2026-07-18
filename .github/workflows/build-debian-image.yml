@@ -135,8 +135,23 @@ jobs:
         with:
           submodules: "false"
 
+      - name: Check ARM emulation registration
+        id: qemu_check
+        shell: bash
+        run: |
+          if [[ -r /proc/sys/fs/binfmt_misc/qemu-arm ]] && \
+             grep -q '^enabled$' /proc/sys/fs/binfmt_misc/qemu-arm; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "ARM binfmt registration is already active."
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up QEMU
+        if: ${{ steps.qemu_check.outputs.ready != 'true' }}
         uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -157,12 +172,15 @@ jobs:
           started_at=$(date +%s)
           docker buildx build \
             --builder steamlink-builder \
+            --progress=plain \
             --platform linux/arm/v7 \
             --build-arg KERNEL_VERSION=${{ inputs.kernel_version }} \
             --build-arg DEBIAN_VERSION=${{ inputs.debian_version }} \
             --file rootfs/Dockerfile \
             --output type=tar,dest=rootfs.tar \
-            .
+            . 2>&1 | tee buildx-rootfs.log
+          cache_hits=$(grep -c ' CACHED$' buildx-rootfs.log || true)
+          echo "ROOTFS_CACHE_HITS=$cache_hits" >> "$GITHUB_ENV"
           echo "ROOTFS_BUILD_SECONDS=$(( $(date +%s) - started_at ))" >> "$GITHUB_ENV"
 
       - name: Create disk image
@@ -195,6 +213,7 @@ jobs:
           {
             echo "### Rootfs and disk image"
             echo "- Rootfs build/export: ${ROOTFS_BUILD_SECONDS:-not completed} seconds"
+            echo "- BuildKit cached steps: ${ROOTFS_CACHE_HITS:-not completed}"
             echo "- Disk image creation/compression: ${IMAGE_BUILD_SECONDS:-not completed} seconds"
             echo "- Rootfs job elapsed: ${elapsed} seconds"
             echo "- BuildKit cache limit: 10 GB"
