@@ -2,8 +2,9 @@
 
 ## Current milestone
 
-Linux 6.1.115 now describes the BG2CD NAND controller and enables the Marvell
-NAND driver at boot. The new compatible is deliberately **probe-only**:
+Linux 6.1.115 now describes the BG2CD (Armada 1500-mini SoC) NAND
+controller and enables the Marvell NAND driver at boot. The new compatible is
+deliberately **probe-only**:
 
 - it may reset the NAND, issue READID and read the parameter page;
 - it does not register an MTD device;
@@ -55,11 +56,11 @@ READID data (8 bytes): 2c 68 04 4a a9 00 00 ff
 READID data (4 bytes): 4f 4e 46 49
 ```
 
-The third result is the `ONFI` signature read from address `0x20`. Identification
-then failed with `-ENODEV` because the Berlin2CD identification parser did not
-accept the ONFI `PARAM` command. The NAND core consequently tried its JEDEC
-fallback at address `0x40`, which returned the ordinary Micron ID rather than a
-JEDEC parameter signature.
+The third result is the `ONFI` (Open NAND Flash Interface) signature read from
+address `0x20`. Identification then failed with `-ENODEV` because the Berlin2CD
+identification parser did not accept the ONFI `PARAM` command. The NAND core
+consequently tried its JEDEC fallback at address `0x40`, which returned the
+ordinary Micron ID rather than a JEDEC parameter signature.
 
 Patch `0003-mtd-nand-read-berlin2cd-onfi-parameters.patch` adds only the
 missing 256-byte ONFI parameter-page operation. Hardware returned a matching
@@ -102,6 +103,19 @@ ONFI extended parameter CRC: calculated=.... expected=.... (valid), signature="E
 ONFI extended ECC: strength=... bits step-size=... bytes ...
 ```
 
+Hardware returned a valid extended page and confirmed the production ECC
+requirement:
+
+```text
+ONFI extended parameter CRC: calculated=71bc expected=71bc (valid), signature="EPPS"
+ONFI extended ECC: strength=24 bits step-size=1024 bytes
+```
+
+This is the same correction density as Valve's setting. The vendor driver uses
+48-bit BCH while processing a 4 KiB page as two independent 2 KiB chunks, so
+its effective requirement is 48 bits per 2048 bytes, equivalent to the ONFI
+24 bits per 1024 bytes.
+
 If the extended read times out, retain the named controller stage and final
 register dump. If its CRC or signature is invalid, do not broaden the operation
 filter or proceed to page reads; first compare repeated 48-byte captures.
@@ -122,9 +136,17 @@ pBridge or clock registers.
 ## Evidence already available
 
 The Valve 3.8 flash table contains Micron IDs beginning with `2c 68` for a 4 GiB,
-8-bit, 4 KiB-page device. It records 48-bit ECC per 4 KiB codeword and marks the
-device randomized. ONFI identification now confirms an MT29F32G08CBACAWP with
-4 KiB pages, 224-byte OOB, 256 pages per erase block and a 4 GiB capacity.
+8-bit, 4 KiB-page device and selects 48-bit ECC. Its page loop operates on two
+2 KiB chunks, making that setting consistent with ONFI's 24-bit-per-1-KiB
+requirement. ONFI identification confirms an MT29F32G08CBACAWP with 4 KiB
+pages, 224-byte OOB, 256 pages per erase block and a 4 GiB capacity.
+
+The final vendor flash-table field is a dual-plane flag, not a randomizer flag.
+The separate vendor randomizer table contains the exact ID
+`2c 68 04 46 89`; its five-byte lookup does not match this unit's
+`2c 68 04 4a a9` ID. The vendor implementation also bypasses randomization for
+blocks 0 through 8. Raw-read experiments must therefore determine whether this
+chip's production data is randomized instead of assuming that it is.
 
 The supplied `steamlink-stock.dtb` has now been inspected. Despite its filename,
 it is the live device tree passed to the running 6.1.115 kernel, not an original
@@ -136,8 +158,25 @@ controller and NAND child only.
 This confirms that mainline Linux was missing the NAND description. It does not
 independently prove the wiring. The controller address (`0xf7f00000`), pBridge
 address (`0xf7d70000`) and SPI 18 interrupt still come from Valve's 3.8 DTS. The
-mainline Berlin2CD clock driver confirms separate NFC and NFC-ECC clocks; the
-pBridge clock should be added when that data path is implemented.
+mainline Berlin2CD clock driver confirms separate NFC, NFC-ECC and pBridge
+clocks. Before patch `0006`, hardware showed the NFC clocks enabled and owned
+by the NAND controller, while the 212.5 MHz pBridge clock was present but
+deviceless and disabled. IRQ 50 (DT SPI 18) was registered as `marvell-nfc`,
+and the platform device remained bound to the driver.
+
+Patch `0006-mtd-nand-map-berlin2cd-pbridge-passively.patch` adds Valve's second
+resource at physical address `0xf7d70000`, claims the pBridge clock and reads
+only side-effect-free status/configuration registers. Expected output begins:
+
+```text
+passive pBridge status: clock=212500000 Hz sem-empty=... sem-full=... dHub-busy=... dHub-pending=...
+passive pBridge control: bus-reset-enable=... bus-reset-done=... BCM-error=... BCM-base=...
+```
+
+This patch does not initialize channels or semaphores, access pBridge TCM,
+submit descriptors, or read NAND pages. After boot, capture those two lines and
+repeat the clock, interrupt and driver-binding checks. The pBridge clock should
+then show one enabled consumer owned by `f7f00000.nand-controller`.
 
 The probe patch treats Berlin2CD as NFCv2 for timing and register capabilities,
 but deliberately uses the explicit NFCv1 command parser for READID and RESET.
@@ -146,15 +185,18 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Validate the extended ONFI ECC strength and codeword size on hardware and
-   compare them with Valve's 48-bit-per-4-KiB BCH configuration.
+1. Boot the passive pBridge patch and record the untouched semaphore, dHub,
+   reset and BCM state.
 2. Port the pBridge channel/semaphore/BCM descriptor primitives with bounded
-   polling and descriptor unit tests.
-3. Implement raw page reads, BCH strength programming and the vendor-compatible
-   randomizer; compare repeated dumps before registering MTD.
-4. Register a read-only MTD and validate full-device hashes and ECC statistics.
-5. Add read-retry support if the confirmed ID requires it.
-6. Put erase/program support behind an explicit Kconfig opt-in, then test only
+   polling, but initially execute only a read-only READID transfer.
+3. Implement repeated raw page reads with BCH disabled and explicitly test
+   randomizer behavior before decoding production data.
+4. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
+   raw captures before registering any MTD.
+5. Register a read-only MTD and validate full-device hashes, bad-block markers
+   and ECC statistics.
+6. Add read-retry support if the confirmed ID requires it.
+7. Put erase/program support behind an explicit Kconfig opt-in, then test only
    on disposable blocks after verified USB recovery.
 
 GPU work is separate. Etnaviv is already upstream in modern Linux and the GC1000
