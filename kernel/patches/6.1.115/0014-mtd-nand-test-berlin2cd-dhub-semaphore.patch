@@ -1,0 +1,273 @@
+The queue 7 test conclusively shows that an HBO FIFO semaphore push leaves
+both producer and consumer queries at zero. The vendor offsets and push
+encoding match the implementation, so distinguish an HBO-specific failure
+from a pBridge-wide SemaHub write failure before attempting descriptors.
+
+Run a bounded 0-1-0 push/pop test on dHub semaphore 25, which Valve assigns
+to APB0 data completion and which the probe already configures at depth
+one. No dHub descriptor or NAND command uses it during probe-only PIO
+operation. Pop only if a token remains.
+
+Clear and sample each test semaphore's write-one-to-clear empty/full
+condition latches around PUSH and POP. These snapshots show whether the
+command reached the selected SemaHub even when its query counts remain at
+zero. Clear the test bits again during cleanup without disturbing unrelated
+semaphores.
+
+Generalize the existing consumer-side poll helper so the dHub and HBO tests
+use identical query semantics. The existing queue 7 test still runs after
+this new discriminator regardless of its result.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 159 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 148 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -199,11 +199,18 @@
+ #define BERLIN2CD_PB_INIT_TIMEOUT_US	100000
+ 
+ /* Internal-only loopback temporarily borrows Valve's implemented queue 7. */
++#define BERLIN2CD_PB_DHUB_SEMA_PUSH	0x0B80
++#define BERLIN2CD_PB_DHUB_SEMA_POP	0x0B84
++#define BERLIN2CD_PB_DHUB_SEMA_EMPTY	0x0B88
++#define BERLIN2CD_PB_DHUB_SEMA_FULL	0x0B8C
+ #define BERLIN2CD_PB_HBO_SEMA_PUSH	0x0F80
+ #define BERLIN2CD_PB_HBO_SEMA_POP	0x0F84
++#define BERLIN2CD_PB_HBO_SEMA_EMPTY	0x0F88
++#define BERLIN2CD_PB_HBO_SEMA_FULL	0x0F8C
+ #define BERLIN2CD_PB_TEST_TCM_OFFSET	0x0440
+ #define BERLIN2CD_PB_TEST_QUEUE		7
+ #define BERLIN2CD_PB_TEST_CHANNEL	3
++#define BERLIN2CD_PB_TEST_DHUB_SEMA	25
+ #define BERLIN2CD_PB_TEST_PATTERN_LOW	0x534C5042
+ #define BERLIN2CD_PB_TEST_PATTERN_HIGH	0xA5C35A3C
+ #define BERLIN2CD_PB_SEMA_DELTA_SHIFT	8
+@@ -607,26 +614,131 @@ static void marvell_berlin2cd_dump_pbridge(struct marvell_nfc *nfc,
+ 			nfc, &marvell_berlin2cd_pbridge_semas[i], stage);
+ }
+ 
+-static int berlin2cd_wait_test_queue(struct marvell_nfc *nfc, u16 expected,
+-				     u32 *producer, u32 *consumer)
++static int berlin2cd_wait_semaphore(struct marvell_nfc *nfc, u32 query,
++				    u8 id, u16 expected,
++				    u32 *producer, u32 *consumer)
+ {
+ 	void __iomem *regs = nfc->pbridge_regs;
+-	const u32 query = BERLIN2CD_PB_HBO_SEMA_QUERY;
+-	const u8 queue = BERLIN2CD_PB_TEST_QUEUE;
+ 	u32 value;
+ 	int ret;
+ 
+ 	ret = readl_relaxed_poll_timeout(regs +
+-		query + (queue << 2) +
++		query + (id << 2) +
+ 		BERLIN2CD_PB_SEMA_CONSUMER, value,
+ 		(value & 0xffff) == expected, 1,
+ 		BERLIN2CD_PB_INIT_TIMEOUT_US);
+ 	*consumer = value;
+-	*producer = marvell_berlin2cd_pbridge_sema_query(regs, query, queue, false);
++	*producer = marvell_berlin2cd_pbridge_sema_query(regs, query, id, false);
+ 
+ 	return ret;
+ }
+ 
++static int berlin2cd_wait_test_queue(struct marvell_nfc *nfc, u16 expected,
++				     u32 *producer, u32 *consumer)
++{
++	return berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_HBO_SEMA_QUERY,
++					 BERLIN2CD_PB_TEST_QUEUE, expected,
++					 producer, consumer);
++}
++
++static void berlin2cd_read_semaphore_events(void __iomem *regs, u32 empty,
++					    u32 full, u8 id,
++					    u32 *empty_event,
++					    u32 *full_event)
++{
++	*empty_event = !!(readl_relaxed(regs + empty) & BIT(id));
++	*full_event = !!(readl_relaxed(regs + full) & BIT(id));
++}
++
++static bool berlin2cd_clear_semaphore_events(void __iomem *regs, u32 empty,
++					     u32 full, u8 id)
++{
++	u32 empty_event, full_event;
++
++	writel(BIT(id), regs + empty);
++	writel(BIT(id), regs + full);
++	/* Complete the W1C writes before testing or reusing the latch. */
++	wmb();
++	berlin2cd_read_semaphore_events(regs, empty, full, id,
++					&empty_event, &full_event);
++
++	return !empty_event && !full_event;
++}
++
++static void marvell_berlin2cd_test_dhub_semaphore(struct marvell_nfc *nfc)
++{
++	void __iomem *regs = nfc->pbridge_regs;
++	const u32 query = BERLIN2CD_PB_DHUB_SEMA_QUERY;
++	const u8 id = BERLIN2CD_PB_TEST_DHUB_SEMA;
++	u32 command = id |
++		      (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
++	u32 producer = 0, consumer = 0;
++	u32 empty_event = 0, full_event = 0;
++	int ret;
++
++	ret = berlin2cd_wait_semaphore(nfc, query, id, 0, &producer, &consumer);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge dHub test semaphore did not start empty: producer=%u/%u consumer=%u/%u\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16);
++		return;
++	}
++
++	if (!berlin2cd_clear_semaphore_events(regs,
++					      BERLIN2CD_PB_DHUB_SEMA_EMPTY,
++					      BERLIN2CD_PB_DHUB_SEMA_FULL,
++					      id))
++		dev_warn(nfc->dev,
++			 "pBridge dHub semaphore condition latches did not clear before push\n");
++	writel(command, regs + BERLIN2CD_PB_DHUB_SEMA_PUSH);
++	ret = berlin2cd_wait_semaphore(nfc, query, id, 1, &producer, &consumer);
++	berlin2cd_read_semaphore_events(regs,
++					BERLIN2CD_PB_DHUB_SEMA_EMPTY,
++					BERLIN2CD_PB_DHUB_SEMA_FULL, id,
++					&empty_event, &full_event);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge dHub semaphore consumer did not observe push: producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16,
++			empty_event, full_event);
++		goto clear_status;
++	}
++
++	dev_info(nfc->dev,
++		 "pBridge dHub semaphore after push: id=%u producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
++		 id, producer & 0xffff,
++		 producer >> 16, consumer & 0xffff, consumer >> 16,
++		 empty_event, full_event);
++
++	writel(command, regs + BERLIN2CD_PB_DHUB_SEMA_POP);
++	ret = berlin2cd_wait_semaphore(nfc, query, id, 0, &producer, &consumer);
++	berlin2cd_read_semaphore_events(regs,
++					BERLIN2CD_PB_DHUB_SEMA_EMPTY,
++					BERLIN2CD_PB_DHUB_SEMA_FULL, id,
++					&empty_event, &full_event);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge dHub semaphore consumer did not observe pop: producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16,
++			empty_event, full_event);
++		goto clear_status;
++	}
++
++	dev_info(nfc->dev,
++		 "pBridge dHub semaphore push/pop test passed: id=%u events empty=%u full=%u\n",
++		 id, empty_event, full_event);
++
++clear_status:
++	if (consumer & 0xffff)
++		writel(command, regs + BERLIN2CD_PB_DHUB_SEMA_POP);
++	berlin2cd_clear_semaphore_events(regs,
++					 BERLIN2CD_PB_DHUB_SEMA_EMPTY,
++					 BERLIN2CD_PB_DHUB_SEMA_FULL, id);
++}
++
+ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ {
+ 	const struct marvell_berlin2cd_pbridge_queue *queue;
+@@ -642,6 +754,7 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 		      (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
+ 	u32 saved_low, saved_high, actual_low, actual_high;
+ 	u32 producer = 0, consumer = 0, status;
++	u32 empty_event = 0, full_event = 0;
+ 	bool passed = false, pushed = false;
+ 	int cleanup_ret = 0;
+ 	int ret;
+@@ -680,6 +793,12 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 		goto disable;
+ 	}
+ 
++	if (!berlin2cd_clear_semaphore_events(regs,
++					      BERLIN2CD_PB_HBO_SEMA_EMPTY,
++					      BERLIN2CD_PB_HBO_SEMA_FULL,
++					      BERLIN2CD_PB_TEST_QUEUE))
++		dev_warn(nfc->dev,
++			 "pBridge HBO queue condition latches did not clear before push\n");
+ 	writel_relaxed(BERLIN2CD_PB_TEST_PATTERN_LOW, tcm);
+ 	writel_relaxed(BERLIN2CD_PB_TEST_PATTERN_HIGH,
+ 		       tcm + sizeof(u32));
+@@ -702,28 +821,41 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 	writel(command, regs + BERLIN2CD_PB_HBO_SEMA_PUSH);
+ 	pushed = true;
+ 	ret = berlin2cd_wait_test_queue(nfc, 1, &producer, &consumer);
++	berlin2cd_read_semaphore_events(regs,
++					BERLIN2CD_PB_HBO_SEMA_EMPTY,
++					BERLIN2CD_PB_HBO_SEMA_FULL,
++					BERLIN2CD_PB_TEST_QUEUE,
++					&empty_event, &full_event);
+ 	if (ret) {
+ 		dev_err(nfc->dev,
+-			"pBridge internal queue consumer did not observe push: producer=%u/%u consumer=%u/%u\n",
++			"pBridge internal queue consumer did not observe push: producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
+ 			producer & 0xffff, producer >> 16,
+-			consumer & 0xffff, consumer >> 16);
++			consumer & 0xffff, consumer >> 16,
++			empty_event, full_event);
+ 		goto disable;
+ 	}
+ 
+ 	dev_info(nfc->dev,
+-		 "pBridge internal queue after push: producer=%u/%u consumer=%u/%u data=%08x:%08x\n",
++		 "pBridge internal queue after push: producer=%u/%u consumer=%u/%u events empty=%u full=%u data=%08x:%08x\n",
+ 		 producer & 0xffff, producer >> 16,
+ 		 consumer & 0xffff, consumer >> 16,
++		 empty_event, full_event,
+ 		 readl_relaxed(tcm + sizeof(u32)), readl_relaxed(tcm));
+ 
+ 	writel(command, regs + BERLIN2CD_PB_HBO_SEMA_POP);
+ 	pushed = false;
+ 	ret = berlin2cd_wait_test_queue(nfc, 0, &producer, &consumer);
++	berlin2cd_read_semaphore_events(regs,
++					BERLIN2CD_PB_HBO_SEMA_EMPTY,
++					BERLIN2CD_PB_HBO_SEMA_FULL,
++					BERLIN2CD_PB_TEST_QUEUE,
++					&empty_event, &full_event);
+ 	if (ret) {
+ 		dev_err(nfc->dev,
+-			"pBridge internal queue consumer did not observe pop: producer=%u/%u consumer=%u/%u\n",
++			"pBridge internal queue consumer did not observe pop: producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
+ 			producer & 0xffff, producer >> 16,
+-			consumer & 0xffff, consumer >> 16);
++			consumer & 0xffff, consumer >> 16,
++			empty_event, full_event);
+ 		goto disable;
+ 	}
+ 
+@@ -732,6 +864,10 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ disable:
+ 	if (pushed)
+ 		writel(command, regs + BERLIN2CD_PB_HBO_SEMA_POP);
++	berlin2cd_clear_semaphore_events(regs,
++					 BERLIN2CD_PB_HBO_SEMA_EMPTY,
++					 BERLIN2CD_PB_HBO_SEMA_FULL,
++					 BERLIN2CD_PB_TEST_QUEUE);
+ 	writel_relaxed(0, fifo + BERLIN2CD_PB_FIFO_START);
+ 	writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_CLEAR);
+ 	cleanup_ret = readl_relaxed_poll_timeout(regs +
+@@ -843,6 +979,7 @@ static void marvell_berlin2cd_init_pbridge(struct marvell_nfc *nfc)
+ 	dev_info(nfc->dev,
+ 		 "pBridge initialized: four 32-byte-MTU channels, eight Valve-layout FIFOs, nine depth-one semaphores\n");
+ 	marvell_berlin2cd_dump_pbridge(nfc, "initialized");
++	marvell_berlin2cd_test_dhub_semaphore(nfc);
+ 	marvell_berlin2cd_test_pbridge(nfc);
+ }
+ 
+-- 
+2.50.1

@@ -298,6 +298,35 @@ the complete boot log. A zero consumer count after this patch is conclusive,
 rather than an uninitialized diagnostic value. PIO READID and both ONFI CRCs
 should still complete, but descriptor work must not proceed.
 
+Hardware running patch `0013` reported zero for both queue 7 queries after the
+push. The failure is therefore real, not a stale diagnostic. TCM remained
+writable, cleanup completed, PIO identification remained stable, both ONFI
+CRCs were valid and `/proc/mtd` stayed empty. A fresh audit also confirmed the
+vendor register layout and command encoding: the HBO SemaHub PUSH register is
+at `0x0f80`, with the ID in bits 0 through 7 and delta in bits 8 through 15.
+
+Patch `0014-mtd-nand-test-berlin2cd-dhub-semaphore.patch` tests the other
+SemaHub inside pBridge before repeating the HBO queue test. It borrows the
+already configured depth-one dHub semaphore 25, performs a bounded `0 -> 1 ->
+0` push/pop transition and clears its latched empty/full status afterward. It
+also clears and samples the dHub and HBO test bits in the condition-latch
+registers around each operation and verifies that the latches accepted their
+write-one-to-clear commands before PUSH. After a successful clear, a set
+`full` event with zero query counts would prove that the PUSH reached the
+SemaHub even though its query path did not reflect the token; no event and zero
+counts points earlier in the write or configuration path. A latch-clear
+warning instead identifies the common status-write path itself as suspect. It
+does not submit a descriptor or issue a NAND command. Expected success is:
+
+```text
+pBridge dHub semaphore after push: id=25 producer=1/... consumer=1/... events empty=0 full=1
+pBridge dHub semaphore push/pop test passed: id=25 events empty=1 full=1
+```
+
+If dHub semaphore 25 passes while queue 7 still fails, the fault is confined
+to the HBO FIFO controller or its configuration. If both pushes fail, focus on
+the common SemaHub write path, clock/reset state or access semantics.
+
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
 without an Oops or timeout reaching the persistent journal. Patch `0008`
@@ -311,18 +340,19 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0013` and verify the internal TCM/FIFO test while PIO
-   identification and ONFI CRCs remain stable.
-2. Port the pBridge descriptor primitives with bounded polling, but
+1. Boot patch `0014` and compare the dHub semaphore result with the HBO queue
+   result while PIO identification and ONFI CRCs remain stable.
+2. Resolve the failing SemaHub layer before porting pBridge descriptors.
+3. Port the pBridge descriptor primitives with bounded polling, but
    initially execute only a read-only READID transfer.
-3. Implement repeated raw page reads with BCH disabled and explicitly test
+4. Implement repeated raw page reads with BCH disabled and explicitly test
    randomizer behavior before decoding production data.
-4. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
+5. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
    raw captures before registering any MTD.
-5. Register a read-only MTD and validate full-device hashes, bad-block markers
+6. Register a read-only MTD and validate full-device hashes, bad-block markers
    and ECC statistics.
-6. Add read-retry support if the confirmed ID requires it.
-7. Put erase/program support behind an explicit Kconfig opt-in, then test only
+7. Add read-retry support if the confirmed ID requires it.
+8. Put erase/program support behind an explicit Kconfig opt-in, then test only
    on disposable blocks after verified USB recovery.
 
 GPU work is separate. Etnaviv is already upstream in modern Linux and the GC1000
