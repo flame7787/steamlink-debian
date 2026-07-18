@@ -1,0 +1,129 @@
+The TCM test succeeds at offset 0x0440, but queue 31 ignores its semaphore
+push and stays at count zero. This suggests that Berlin2CD implements only
+the eight HBO queues Valve uses, rather than all 32 queues in the generic
+register block.
+
+Repeat the same bounded test on implemented queue 7. Stop dHub channel 3
+before borrowing its data queue, clear and configure queue 7 at depth one,
+then run the existing TCM readback and 0-1-0 push/pop test. On cleanup,
+restore queue 7's Valve base and depth before restarting channel 3.
+
+If clearing or cleanup times out, leave the channel stopped rather than
+restart a potentially inconsistent queue. The normal PIO identification
+path is independent of pBridge and can continue. This test submits no dHub
+descriptor or NAND command.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 45 ++++++++++++++++++++++-------
+ 1 file changed, 33 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -198,11 +198,12 @@
+ #define BERLIN2CD_PB_CHANNEL_MTU_32	0x01
+ #define BERLIN2CD_PB_INIT_TIMEOUT_US	100000
+ 
+-/* Internal-only loopback starts after Valve's TCM allocation on queue 31. */
++/* Internal-only loopback temporarily borrows Valve's implemented queue 7. */
+ #define BERLIN2CD_PB_HBO_SEMA_PUSH	0x0F80
+ #define BERLIN2CD_PB_HBO_SEMA_POP	0x0F84
+ #define BERLIN2CD_PB_TEST_TCM_OFFSET	0x0440
+-#define BERLIN2CD_PB_TEST_QUEUE		31
++#define BERLIN2CD_PB_TEST_QUEUE		7
++#define BERLIN2CD_PB_TEST_CHANNEL	3
+ #define BERLIN2CD_PB_TEST_PATTERN_LOW	0x534C5042
+ #define BERLIN2CD_PB_TEST_PATTERN_HIGH	0xA5C35A3C
+ #define BERLIN2CD_PB_SEMA_DELTA_SHIFT	8
+@@ -635,23 +636,28 @@
+ 
+ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ {
++	const struct marvell_berlin2cd_pbridge_queue *queue;
+ 	void __iomem *regs = nfc->pbridge_regs;
+ 	void __iomem *fifo = regs + BERLIN2CD_PB_HBO_FIFO_CFG +
+ 		BERLIN2CD_PB_TEST_QUEUE * BERLIN2CD_PB_FIFO_STRIDE;
+ 	void __iomem *sema = regs + BERLIN2CD_PB_HBO_SEMA_CFG +
+ 		BERLIN2CD_PB_TEST_QUEUE * BERLIN2CD_PB_SEMA_STRIDE;
++	void __iomem *channel = regs + BERLIN2CD_PB_DHUB_CHANNEL_CFG +
++		BERLIN2CD_PB_TEST_CHANNEL * BERLIN2CD_PB_CHANNEL_STRIDE;
+ 	void __iomem *tcm = regs + BERLIN2CD_PB_TEST_TCM_OFFSET;
+ 	u32 command = BERLIN2CD_PB_TEST_QUEUE |
+ 		      (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
+ 	u32 saved_low, saved_high, actual_low, actual_high;
+ 	u32 producer = 0, consumer = 0, status;
+-	bool pushed = false;
+-	int cleanup_ret;
++	bool passed = false, pushed = false;
++	int cleanup_ret = 0;
+ 	int ret;
+ 
++	queue = &marvell_berlin2cd_pbridge_queues[BERLIN2CD_PB_TEST_QUEUE];
+ 	saved_low = readl_relaxed(tcm);
+ 	saved_high = readl_relaxed(tcm + sizeof(u32));
+ 
++	writel_relaxed(0, channel + BERLIN2CD_PB_CHANNEL_START);
+ 	writel_relaxed(0, fifo + BERLIN2CD_PB_FIFO_START);
+ 	writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_CLEAR);
+ 	ret = readl_relaxed_poll_timeout(regs + BERLIN2CD_PB_HBO_BUSY,
+@@ -662,7 +668,8 @@
+ 		dev_err(nfc->dev,
+ 			"pBridge internal test queue clear timed out: HBO-busy=%08x\n",
+ 			status);
+-		goto restore;
++		cleanup_ret = ret;
++		goto restore_tcm;
+ 	}
+ 
+ 	writel_relaxed(BERLIN2CD_PB_TEST_TCM_OFFSET, fifo);
+@@ -727,9 +734,7 @@
+ 		goto disable;
+ 	}
+ 
+-	dev_info(nfc->dev,
+-		 "pBridge internal TCM/FIFO test passed: queue=%u offset=%04x\n",
+-		 BERLIN2CD_PB_TEST_QUEUE, BERLIN2CD_PB_TEST_TCM_OFFSET);
++	passed = true;
+ 
+ disable:
+ 	if (pushed)
+@@ -740,17 +745,33 @@
+ 		BERLIN2CD_PB_HBO_BUSY, status,
+ 		!(status & BIT(BERLIN2CD_PB_TEST_QUEUE)), 1,
+ 		BERLIN2CD_PB_INIT_TIMEOUT_US);
+-	writel_relaxed(0, sema);
+-	if (cleanup_ret)
++	if (cleanup_ret) {
+ 		dev_err(nfc->dev,
+ 			"pBridge internal test cleanup timed out: HBO-busy=%08x\n",
+ 			status);
++		goto restore_tcm;
++	}
+ 
+-restore:
++restore_tcm:
+ 	writel_relaxed(saved_low, tcm);
+ 	writel_relaxed(saved_high, tcm + sizeof(u32));
+-	/* Complete restoration before normal probe activity resumes. */
++	/* Restore Valve's queue before normal probe activity resumes. */
+ 	wmb();
++	if (cleanup_ret)
++		return;
++
++	writel_relaxed(queue->base, fifo);
++	writel_relaxed(queue->depth, sema);
++	writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_START);
++	writel_relaxed(1, channel + BERLIN2CD_PB_CHANNEL_START);
++	/* Complete queue and channel restoration before returning. */
++	wmb();
++
++	if (passed)
++		dev_info(nfc->dev,
++			 "pBridge internal TCM/FIFO test passed: queue=%u offset=%04x\n",
++			 BERLIN2CD_PB_TEST_QUEUE,
++			 BERLIN2CD_PB_TEST_TCM_OFFSET);
+ }
+ 
+ static void marvell_berlin2cd_init_pbridge(struct marvell_nfc *nfc)
+-- 
+2.50.1

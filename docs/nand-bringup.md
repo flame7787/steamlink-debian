@@ -265,11 +265,22 @@ assumed for Berlin2CD's extreme tail.
 Patch `0011-mtd-nand-retry-berlin2cd-tcm-after-valve-layout.patch` moves the
 same reversible test to `0x0440`, the first 64-bit word after Valve's queue
 allocation ends at `0x043f`. It also reports the exact expected and actual
-words if readback fails again. Expected successful output is:
+words if readback fails again.
+
+Hardware advanced past TCM readback at `0x0440`, confirming that this word is
+writable, but queue 31 ignored the push and both query counts stayed zero.
+This suggests that Berlin2CD implements only Valve's queues 0 through 7 rather
+than all 32 queues in the generic HBO description. Cleanup, PIO identification
+and both ONFI CRCs still completed normally.
+
+Patch `0012-mtd-nand-test-berlin2cd-implemented-fifo.patch` repeats the test on
+implemented queue 7. It first stops channel 3, temporarily configures its data
+queue at depth one, and restores the exact Valve queue base/depth before
+restarting the channel. Expected successful output is:
 
 ```text
 pBridge internal queue after push: producer=1/... consumer=1/... data=a5c35a3c:534c5042
-pBridge internal TCM/FIFO test passed: queue=31 offset=0440
+pBridge internal TCM/FIFO test passed: queue=7 offset=0440
 ```
 
 If the patch reports a TCM readback error or a clear, push, pop or cleanup
@@ -289,7 +300,7 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0011` and verify the internal TCM/FIFO test while PIO
+1. Boot patch `0012` and verify the internal TCM/FIFO test while PIO
    identification and ONFI CRCs remain stable.
 2. Port the pBridge descriptor primitives with bounded polling, but
    initially execute only a read-only READID transfer.
