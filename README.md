@@ -31,6 +31,8 @@ debian@steamlink:~$ fastfetch
 
 Download an image of Debian version of your choice from the [Releases](https://github.com/flame7787/steamlink-debian/releases) page and flash it on a 2GB (or bigger) USB stick using [balenaEtcher](https://etcher.balena.io/) or any other USB flasher. SD cards paired with a USB SD Reader work as well.
 
+> I would highly recommend anything solid state for the boot drive, as the Steam Link will sometimes boot straight to the internal OS due to the long HDD spinup time
+
 > :warning: **Warning**: Flashing the image on the USB stick will wipe all data stored on the device!
 
 Plug the USB stick into the Steam Link and power it on. The device will boot from the USB stick and appear on your network soon.

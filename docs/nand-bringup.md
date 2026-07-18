@@ -46,8 +46,39 @@ NDTR0CS0 = 0x84840a12
 NDTR1CS0 = 0x00208662
 ```
 
-It logs both READID transfers. A matching Micron result is expected to begin
-with either `2c 68 04 4a` or `2c 68 04 46`. Interpret failures as follows:
+It logs both READID transfers. Hardware testing produced matching, stable
+results and confirmed that the timing, chip-select and PIO command path work:
+
+```text
+READID data (2 bytes): 2c 68
+READID data (8 bytes): 2c 68 04 4a a9 00 00 ff
+READID data (4 bytes): 4f 4e 46 49
+```
+
+The third result is the `ONFI` signature read from address `0x20`. Identification
+then failed with `-ENODEV` because the Berlin2CD identification parser did not
+accept the ONFI `PARAM` command. The NAND core consequently tried its JEDEC
+fallback at address `0x40`, which returned the ordinary Micron ID rather than a
+JEDEC parameter signature.
+
+Patch `0003-mtd-nand-read-berlin2cd-onfi-parameters.patch` adds only the
+missing 256-byte ONFI parameter-page operation. It logs the generated command,
+the first 32 parameter bytes, and the calculated and stored ONFI CRC. A healthy
+result should contain:
+
+```text
+ONFI parameter data (256 bytes, first 32): 4f 4e 46 49 ...
+ONFI parameter CRC: calculated=.... expected=.... (valid)
+```
+
+The NAND core should then report the model and geometry, followed by the
+probe-only warning. The controller must remain bound, while `/proc/mtd` remains
+empty and no `/dev/mtd*` devices are created. If the CRC is invalid or the
+operation times out, retain the complete parameter-command and final-register
+messages before changing geometry or enabling any page reads.
+
+For earlier READID failures, a matching Micron result is expected to begin with
+either `2c 68 04 4a` or `2c 68 04 46`. Interpret failures as follows:
 
 - all `ff`: check chip select, pin mux, power and external signaling;
 - all `00` or repeated words: check FIFO and controller mode;
@@ -86,7 +117,8 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Confirm READID and controller clock/interrupt behavior on hardware.
+1. Confirm the ONFI parameter-page contents, CRC, model and geometry while the
+   controller remains probe-only.
 2. Port the pBridge channel/semaphore/BCM descriptor primitives with bounded
    polling and descriptor unit tests.
 3. Implement raw page reads, BCH strength programming and the vendor-compatible
