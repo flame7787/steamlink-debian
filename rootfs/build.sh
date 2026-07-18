@@ -1,37 +1,62 @@
 #!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-dd if=/dev/zero of=steamlink-debian.img bs=1M count=1024
+IMAGE=steamlink-debian.img
+MOUNT_DIR=""
+LOOP_DEV=""
 
-# Use parted to create a partition table and a single primary partition
-parted --script steamlink-debian.img mklabel msdos        # Create an msdos partition table
-parted --script steamlink-debian.img mkpart primary ext3 1MiB 100%  # Create a primary partition
+cleanup() {
+	local status=$?
+
+	trap - EXIT
+	set +e
+
+	if [[ -n "$MOUNT_DIR" ]] && mountpoint -q "$MOUNT_DIR"; then
+		umount "$MOUNT_DIR"
+	fi
+
+	if [[ -n "$LOOP_DEV" ]]; then
+		losetup -d "$LOOP_DEV"
+	fi
+
+	if [[ -n "$MOUNT_DIR" ]]; then
+		rmdir "$MOUNT_DIR"
+	fi
+
+	exit "$status"
+}
+
+trap cleanup EXIT
+
+dd if=/dev/zero of="$IMAGE" bs=1M count=1024
+
+# Create an MBR partition table with one ext3 partition.
+parted --script "$IMAGE" mklabel msdos
+parted --script "$IMAGE" mkpart primary ext3 1MiB 100%
 
 sync
 
-# Set up a loop device with partition mapping
-LOOP_DEV=$(losetup --show -P -f steamlink-debian.img)
+# Use a private mount point so concurrent or interrupted builds do not share
+# persistent state under /mnt.
+MOUNT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/steamlink-rootfs.XXXXXX")
+LOOP_DEV=$(losetup --show -P -f "$IMAGE")
 
 sync
 
-# Format the first partition with ext3
 mkfs.ext3 "${LOOP_DEV}p1"
-
+mount "${LOOP_DEV}p1" "$MOUNT_DIR"
+tar -xpf rootfs.tar -C "$MOUNT_DIR"
+rm -f "$MOUNT_DIR/.dockerenv"
 sync
 
-# Mount the partition
-mkdir /mnt/disk
-mount "${LOOP_DEV}p1" /mnt/disk
-tar -xpf rootfs.tar -C /mnt/disk/
-rm -rf /mnt/disk/.dockerenv
-umount -l /mnt/disk
+umount "$MOUNT_DIR"
+rmdir "$MOUNT_DIR"
+MOUNT_DIR=""
 
-# Detach the loop device
-losetup -d $LOOP_DEV
+losetup -d "$LOOP_DEV"
+LOOP_DEV=""
 
-# Compress the image file
-xz -z steamlink-debian.img
-
-# Make the image file readable for non-root users
-chmod 777 steamlink-debian.img.xz
+# Replace an output left by an earlier run and make it artifact-readable.
+xz -f "$IMAGE"
+chmod 0644 "${IMAGE}.xz"
