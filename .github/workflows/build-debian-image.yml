@@ -153,12 +153,45 @@ jobs:
         with:
           platforms: arm
 
+      - name: Configure persistent Buildx metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          buildx_config="${RUNNER_TOOL_CACHE:-$HOME/.cache}/steamlink-buildx"
+          builder_name="steamlink-builder"
+          builder_container="buildx_buildkit_${builder_name}0"
+
+          mkdir -p "$buildx_config"
+          echo "BUILDX_CONFIG=$buildx_config" >> "$GITHUB_ENV"
+          echo "Persistent Buildx metadata: $buildx_config"
+
+          # A previous setup-buildx invocation may have left the BuildKit
+          # container and its named state volume behind while its per-user
+          # builder registration was lost. Remove only that orphaned
+          # container so Buildx can recreate it with the same deterministic
+          # name. Docker retains the state volume because -v is not used.
+          if ! BUILDX_CONFIG="$buildx_config" \
+              docker buildx inspect "$builder_name" >/dev/null 2>&1; then
+            if docker container inspect "$builder_container" >/dev/null 2>&1; then
+              echo "Removing orphaned $builder_container; preserving its cache volume."
+              docker rm -f "$builder_container"
+            fi
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
           name: steamlink-builder
           keep-state: true
           cleanup: false
+
+      - name: Verify persistent Buildx cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx inspect steamlink-builder
+          docker buildx du --builder steamlink-builder
 
       - name: Download kernel artifact
         uses: actions/download-artifact@v8
@@ -217,4 +250,5 @@ jobs:
             echo "- Disk image creation/compression: ${IMAGE_BUILD_SECONDS:-not completed} seconds"
             echo "- Rootfs job elapsed: ${elapsed} seconds"
             echo "- BuildKit cache limit: 10 GB"
+            echo "- Buildx metadata: \`${BUILDX_CONFIG:-not configured}\`"
           } >> "$GITHUB_STEP_SUMMARY"
