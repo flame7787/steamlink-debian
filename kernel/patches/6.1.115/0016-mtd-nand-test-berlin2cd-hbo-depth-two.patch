@@ -1,0 +1,78 @@
+The isolated HBO queue test receives a full-condition event after one push,
+but both immediate and delayed producer/consumer queries remain zero.  The
+common dHub SemaHub accepts depth one, but Valve's HBO command and data
+queues use depths two and 32.  Test whether depth one is unsupported by the
+HBO FiFoCtl SemaHub on Berlin2CD.
+
+Configure the borrowed queue at depth two and push one token.  Both query
+maps should report count one and the full condition should remain clear.
+Include the configured depth in the diagnostics and warn if a successful
+count transition nevertheless asserts full.
+
+Channel 3 remains fully stopped and cleared throughout the test.  Restore
+its native depth-32 data queue afterward.  No descriptor is submitted and
+no NAND command or media data is accessed.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -210,6 +210,7 @@
+ #define BERLIN2CD_PB_HBO_SEMA_FULL	0x0F8C
+ #define BERLIN2CD_PB_TEST_TCM_OFFSET	0x0440
+ #define BERLIN2CD_PB_TEST_QUEUE		7
++#define BERLIN2CD_PB_TEST_QUEUE_DEPTH	2
+ #define BERLIN2CD_PB_TEST_COMMAND_QUEUE	6
+ #define BERLIN2CD_PB_TEST_CHANNEL	3
+ #define BERLIN2CD_PB_TEST_DHUB_SEMA	25
+@@ -809,7 +810,7 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 	}
+ 
+ 	writel_relaxed(BERLIN2CD_PB_TEST_TCM_OFFSET, fifo);
+-	writel_relaxed(1, sema);
++	writel_relaxed(BERLIN2CD_PB_TEST_QUEUE_DEPTH, sema);
+ 	writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_START);
+ 	/* Publish queue configuration before querying it. */
+ 	wmb();
+@@ -863,7 +864,8 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 					&empty_event, &full_event);
+ 	if (ret) {
+ 		dev_err(nfc->dev,
+-			"pBridge internal queue consumer did not observe push: first producer=%u/%u consumer=%u/%u; final producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
++			"pBridge internal queue consumer did not observe push at depth %u: first producer=%u/%u consumer=%u/%u; final producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
++			BERLIN2CD_PB_TEST_QUEUE_DEPTH,
+ 			first_producer & 0xffff, first_producer >> 16,
+ 			first_consumer & 0xffff, first_consumer >> 16,
+ 			producer & 0xffff, producer >> 16,
+@@ -871,9 +873,14 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 			empty_event, full_event);
+ 		goto disable;
+ 	}
++	if (full_event)
++		dev_warn(nfc->dev,
++			 "pBridge HBO queue full condition asserted after one push at depth %u\n",
++			 BERLIN2CD_PB_TEST_QUEUE_DEPTH);
+ 
+ 	dev_info(nfc->dev,
+-		 "pBridge internal queue after push: first producer=%u/%u consumer=%u/%u; final producer=%u/%u consumer=%u/%u events empty=%u full=%u data=%08x:%08x\n",
++		 "pBridge internal queue after push at depth %u: first producer=%u/%u consumer=%u/%u; final producer=%u/%u consumer=%u/%u events empty=%u full=%u data=%08x:%08x\n",
++		 BERLIN2CD_PB_TEST_QUEUE_DEPTH,
+ 		 first_producer & 0xffff, first_producer >> 16,
+ 		 first_consumer & 0xffff, first_consumer >> 16,
+ 		 producer & 0xffff, producer >> 16,
+@@ -938,8 +945,9 @@ restore_tcm:
+ 
+ 	if (passed)
+ 		dev_info(nfc->dev,
+-			 "pBridge internal TCM/FIFO test passed: queue=%u offset=%04x\n",
++			 "pBridge internal TCM/FIFO test passed: queue=%u depth=%u offset=%04x\n",
+ 			 BERLIN2CD_PB_TEST_QUEUE,
++			 BERLIN2CD_PB_TEST_QUEUE_DEPTH,
+ 			 BERLIN2CD_PB_TEST_TCM_OFFSET);
+ }
+ 
+-- 
+2.50.1

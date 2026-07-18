@@ -356,6 +356,29 @@ appears, the PUSH reached HBO but either vanished before the first MMIO read or
 the HBO count-query semantics differ on Berlin2CD. A full-condition warning
 makes the post-PUSH full bit ambiguous and should be retained in the log.
 
+Hardware running patch `0015` completed the full channel-clear sequence with
+no dHub, pending, or HBO timeout. Both immediate and delayed HBO queries still
+reported zero, while the independently cleared full condition asserted after
+the PUSH. The channel-consumer hypothesis is therefore disproved. The same
+boot again produced stable Micron ID and ONFI data with both CRCs valid.
+
+Valve's HAL uses depth one for the separate dHub completion semaphores, but its
+HBO command/data queues use depths two and 32. Patch
+`0016-mtd-nand-test-berlin2cd-hbo-depth-two.patch` repeats the isolated queue 7
+test at depth two. One pushed token should not fill a depth-two queue. Expected
+success is:
+
+```text
+pBridge internal queue after push at depth 2: first producer=1/... consumer=1/...; final producer=1/... consumer=1/... events empty=... full=0 data=a5c35a3c:534c5042
+pBridge internal TCM/FIFO test passed: queue=7 depth=2 offset=0440
+```
+
+If this passes, depth one is not usable for Berlin2CD's HBO FiFoCtl even though
+it works in the dHub SemaHub. If counts remain zero and `full=1`, the configured
+depth was not accepted or the HBO full/query semantics differ from the common
+SemaHub. If counts become one but `full=1`, retain the dedicated warning: the
+query path works, but the full-condition behavior needs separate handling.
+
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
 without an Oops or timeout reaching the persistent journal. Patch `0008`
@@ -369,9 +392,9 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0015` and compare the immediate and final HBO queue queries
-   after the complete channel-clear sequence.
-2. Resolve the failing SemaHub layer before porting pBridge descriptors.
+1. Boot patch `0016` and compare the depth-two HBO count and full-condition
+   behavior with the passing depth-one dHub semaphore.
+2. Resolve the failing HBO FiFoCtl layer before porting pBridge descriptors.
 3. Port the pBridge descriptor primitives with bounded polling, but
    initially execute only a read-only READID transfer.
 4. Implement repeated raw page reads with BCH disabled and explicitly test
