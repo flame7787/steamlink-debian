@@ -2,14 +2,33 @@
 
 set -e
 
+REPO_ROOT=$(pwd)
 export ARCH=arm; export LOCALVERSION="-steam"
 
-mkdir boot
+mkdir -p boot
 cd steamlink-sdk
 source setenv.sh
 cd ../linux-$KERNEL_VERSION
+
+PATCH_DIR="$REPO_ROOT/kernel/patches/$KERNEL_VERSION"
+if [[ -d "$PATCH_DIR" ]]; then
+	shopt -s nullglob
+	for kernel_patch in "$PATCH_DIR"/*.patch; do
+		echo "Applying $(basename "$kernel_patch")"
+		if patch --batch --forward --dry-run -p1 < "$kernel_patch" >/dev/null; then
+			patch --batch --forward -p1 < "$kernel_patch"
+		elif patch --batch --reverse --dry-run -p1 < "$kernel_patch" >/dev/null; then
+			echo "Already applied: $(basename "$kernel_patch")"
+		else
+			echo "Patch does not apply cleanly: $kernel_patch" >&2
+			exit 1
+		fi
+	done
+fi
+
 make olddefconfig
 make -j$(nproc)
 make modules
-mkdir /tmp/build-modules
+rm -rf /tmp/build-modules
+mkdir -p /tmp/build-modules
 INSTALL_MOD_PATH=/tmp/build-modules make modules_install

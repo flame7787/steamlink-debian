@@ -1,0 +1,243 @@
+The Berlin2CD NFC shares the Marvell NFCv2 register layout but uses the
+explicit command patterns for READID and RESET. Its production data path
+also requires the pBridge descriptor engine, explicit BCH strength
+programming and the vendor data randomizer. Add enough support to identify
+the flash non-destructively while deliberately refusing to register an MTD
+device.
+
+This gives hardware bring-up a safe READID/parameter-page milestone without
+making incomplete page reads or erase/program operations available to
+userspace.
+
+---
+ Documentation/devicetree/bindings/mtd/marvell-nand.txt |  5 +++++
+ arch/arm/boot/dts/berlin2cd-valve-steamlink.dts         |  9 +++++++++
+ arch/arm/boot/dts/berlin2cd.dtsi                        | 12 ++++++++++++
+ drivers/mtd/nand/raw/marvell_nand.c                     | 40 ++++++++++++++++++++--
+ drivers/mtd/nand/raw/nand_base.c                        | 31 +++++++++++++++++++++++++++++++
+ include/linux/mtd/rawnand.h                             |  2 ++
+ 6 files changed, 96 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/mtd/marvell-nand.txt b/Documentation/devicetree/bindings/mtd/marvell-nand.txt
+index a2d9a0f..75ef188 100644
+--- a/Documentation/devicetree/bindings/mtd/marvell-nand.txt
++++ b/Documentation/devicetree/bindings/mtd/marvell-nand.txt
+@@ -5,9 +5,14 @@ Required properties:
+     * "marvell,armada-8k-nand-controller"
+     * "marvell,armada370-nand-controller"
+     * "marvell,pxa3xx-nand-controller"
++    * "marvell,berlin2cd-nand-controller"
+     * "marvell,armada-8k-nand" (deprecated)
+     * "marvell,armada370-nand" (deprecated)
+     * "marvell,pxa3xx-nand" (deprecated)
++
++  The Berlin2CD controller is currently limited to non-destructive flash
++  identification. Its pBridge descriptor engine, BCH strength programming and
++  data randomizer must be supported before an MTD device can be registered.
+   Compatibles marked deprecated support only the old bindings described
+   at the bottom.
+ - reg: NAND flash controller memory area.
+diff --git a/arch/arm/boot/dts/berlin2cd-valve-steamlink.dts b/arch/arm/boot/dts/berlin2cd-valve-steamlink.dts
+index 79ac842..b017f0d 100644
+--- a/arch/arm/boot/dts/berlin2cd-valve-steamlink.dts
++++ b/arch/arm/boot/dts/berlin2cd-valve-steamlink.dts
+@@ -67,6 +67,15 @@
+ 	status = "okay";
+ };
+ 
++&nfc {
++	status = "okay";
++
++	nand@0 {
++		reg = <0>;
++		nand-rb = <0>;
++	};
++};
++
+ /* The SoC is connected to on-board USB hub that in turn has one downstream
+  * port wired to the on-board Steam Controller wireless receiver chip. */
+ &usb_phy1 { status = "okay"; };
+diff --git a/arch/arm/boot/dts/berlin2cd.dtsi b/arch/arm/boot/dts/berlin2cd.dtsi
+index b2768f7..bbac480 100644
+--- a/arch/arm/boot/dts/berlin2cd.dtsi
++++ b/arch/arm/boot/dts/berlin2cd.dtsi
+@@ -163,6 +163,18 @@
+ 			};
+ 		};
+ 
++		nfc: nand-controller@f00000 {
++			compatible = "marvell,berlin2cd-nand-controller";
++			reg = <0xf00000 0x10000>;
++			interrupts = <GIC_SPI 18 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&chip_clk CLKID_NFC>,
++				 <&chip_clk CLKID_NFC_ECC>;
++			clock-names = "core", "reg";
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++
+ 		apb@e80000 {
+ 			compatible = "simple-bus";
+ 			#address-cells = <1>;
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+index d527c03..1ad34c5 100644
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -367,6 +367,8 @@ static inline struct marvell_nand_chip_sel *to_nand_sel(struct marvell_nand_chip
+  *			BCH error detection and correction algorithm,
+  *			NDCB3 register has been added
+  * @use_dma:		Use dma for data transfers
++ * @use_nfcv1_parser:	Use the explicit NFCv1 command patterns
++ * @probe_only:	Identify the attached NAND but do not register an MTD device
+  */
+ struct marvell_nfc_caps {
+ 	unsigned int max_cs_nb;
+@@ -375,6 +377,8 @@ struct marvell_nfc_caps {
+ 	bool legacy_of_bindings;
+ 	bool is_nfcv2;
+ 	bool use_dma;
++	bool use_nfcv1_parser;
++	bool probe_only;
+ };
+ 
+ /**
+@@ -2176,7 +2180,7 @@ static int marvell_nfc_exec_op(struct nand_chip *chip,
+ 	if (!check_only)
+ 		marvell_nfc_select_target(chip, op->cs);
+ 
+-	if (nfc->caps->is_nfcv2)
++	if (nfc->caps->is_nfcv2 && !nfc->caps->use_nfcv1_parser)
+ 		return nand_op_parser_exec_op(chip, &marvell_nfcv2_op_parser,
+ 					      op, check_only);
+ 	else
+@@ -2720,12 +2724,30 @@ static int marvell_nand_chip_init(struct device *dev, struct marvell_nfc *nfc,
+ 
+ 	chip->options |= NAND_BUSWIDTH_AUTO;
+ 
+-	ret = nand_scan(chip, marvell_nand->nsels);
++	if (nfc->caps->probe_only)
++		ret = nand_scan_ident_only(chip, marvell_nand->nsels);
++	else
++		ret = nand_scan(chip, marvell_nand->nsels);
+ 	if (ret) {
+ 		dev_err(dev, "could not scan the nand chip\n");
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Berlin BG2CD needs its pBridge descriptor engine, BCH strength
++	 * programming and data randomizer ported before page data can be exposed
++	 * safely.  READID and parameter-page accesses are sufficient for the
++	 * initial hardware identification milestone, but registering an MTD here
++	 * would make incomplete reads look trustworthy and would expose erase and
++	 * program operations.
++	 */
++	if (nfc->caps->probe_only) {
++		dev_warn(dev,
++			 "probe-only mode: MTD registration disabled until Berlin ECC/randomizer support is available\n");
++		nand_cleanup_ident_only(chip);
++		return 0;
++	}
++
+ 	if (pdata)
+ 		/* Legacy bindings support only one chip */
+ 		ret = mtd_device_register(mtd, pdata->parts, pdata->nr_parts);
+@@ -2915,7 +2937,7 @@ static int marvell_nfc_init(struct marvell_nfc *nfc)
+ 	}
+ 
+ 	/* Configure the DMA if appropriate */
+-	if (!nfc->caps->is_nfcv2)
++	if (nfc->caps->use_dma)
+ 		marvell_nfc_init_dma(nfc);
+ 
+ 	marvell_nfc_reset(nfc);
+@@ -3093,6 +3115,14 @@ static const struct marvell_nfc_caps marvell_armada370_nfc_caps = {
+ 	.is_nfcv2 = true,
+ };
+ 
++static const struct marvell_nfc_caps marvell_berlin2cd_nfc_caps = {
++	.max_cs_nb = 1,
++	.max_rb_nb = 1,
++	.is_nfcv2 = true,
++	.use_nfcv1_parser = true,
++	.probe_only = true,
++};
++
+ static const struct marvell_nfc_caps marvell_pxa3xx_nfc_caps = {
+ 	.max_cs_nb = 2,
+ 	.max_rb_nb = 1,
+@@ -3139,6 +3169,10 @@ static const struct of_device_id marvell_nfc_of_ids[] = {
+ 		.compatible = "marvell,armada370-nand-controller",
+ 		.data = &marvell_armada370_nfc_caps,
+ 	},
++	{
++		.compatible = "marvell,berlin2cd-nand-controller",
++		.data = &marvell_berlin2cd_nfc_caps,
++	},
+ 	{
+ 		.compatible = "marvell,pxa3xx-nand-controller",
+ 		.data = &marvell_pxa3xx_nfc_caps,
+diff --git a/drivers/mtd/nand/raw/nand_base.c b/drivers/mtd/nand/raw/nand_base.c
+index ea7e37a..c520996 100644
+--- a/drivers/mtd/nand/raw/nand_base.c
++++ b/drivers/mtd/nand/raw/nand_base.c
+@@ -5514,12 +5514,43 @@ static int nand_scan_ident(struct nand_chip *chip, unsigned int maxchips,
+ 	return 0;
+ }
+ 
++/**
++ * nand_scan_ident_only - identify a NAND without attaching or scanning it
++ * @chip: NAND chip object
++ * @maxchips: number of chips to detect
++ *
++ * This is restricted to controller bring-up where page access is not safe yet.
++ * The caller must use nand_cleanup_ident_only() after a successful call.
++ */
++int nand_scan_ident_only(struct nand_chip *chip, unsigned int maxchips)
++{
++	if (!maxchips)
++		return -EINVAL;
++
++	return nand_scan_ident(chip, maxchips, NULL);
++}
++EXPORT_SYMBOL_GPL(nand_scan_ident_only);
++
+ static void nand_scan_ident_cleanup(struct nand_chip *chip)
+ {
+ 	kfree(chip->parameters.model);
+ 	kfree(chip->parameters.onfi);
+ }
+ 
++/**
++ * nand_cleanup_ident_only - release resources allocated by identification
++ * @chip: NAND chip object
++ *
++ * This is the cleanup counterpart to nand_scan_ident_only().  It deliberately
++ * avoids the manufacturer and NAND-device cleanup performed by nand_cleanup(),
++ * because those objects are initialized only by the later scan phases.
++ */
++void nand_cleanup_ident_only(struct nand_chip *chip)
++{
++	nand_scan_ident_cleanup(chip);
++}
++EXPORT_SYMBOL_GPL(nand_cleanup_ident_only);
++
+ int rawnand_sw_hamming_init(struct nand_chip *chip)
+ {
+ 	struct nand_ecc_sw_hamming_conf *engine_conf;
+diff --git a/include/linux/mtd/rawnand.h b/include/linux/mtd/rawnand.h
+index dcf9014..d44b28d 100644
+--- a/include/linux/mtd/rawnand.h
++++ b/include/linux/mtd/rawnand.h
+@@ -1547,6 +1547,8 @@ int nand_read_page_hwecc_oob_first(struct nand_chip *chip, uint8_t *buf,
+ /* Scan and identify a NAND device */
+ int nand_scan_with_ids(struct nand_chip *chip, unsigned int max_chips,
+ 		       struct nand_flash_dev *ids);
++int nand_scan_ident_only(struct nand_chip *chip, unsigned int max_chips);
++void nand_cleanup_ident_only(struct nand_chip *chip);
+ 
+ static inline int nand_scan(struct nand_chip *chip, unsigned int max_chips)
+ {
+-- 
+2.50.1

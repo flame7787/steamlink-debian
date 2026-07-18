@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        run: apt-get update && apt-get install -y --no-install-recommends bash ca-certificates git tar xz-utils wget build-essential flex bison libssl-dev libelf-dev bc kmod
+        run: apt-get update && apt-get install -y --no-install-recommends bash ca-certificates git tar xz-utils wget patch build-essential flex bison libssl-dev libelf-dev bc kmod
 
       - name: Checkout repository
         uses: actions/checkout@v2
