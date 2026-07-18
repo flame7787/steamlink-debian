@@ -1,0 +1,156 @@
+Berlin2CD now identifies the Steam Link NAND as a Micron
+MT29F32G08CBACAWP and reads a valid ONFI parameter page. Tighten the
+probe-only path before beginning pBridge work.
+
+Reject every operation except RESET, READID, STATUS and the exact
+256-byte ONFI parameter-page read, including during exec_op capability
+checks. Remove the inherited erase and standalone wait patterns so the
+controller cannot advertise operations outside identification. Propagate
+PIO transfer errors instead of silently continuing, and log the validated
+ONFI identity, geometry, reliability and timing fields needed to plan ECC
+support.
+
+The controller remains probe-only and no MTD device is registered.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 89 +++++++++++++++++++++++++++++++------
+ 1 file changed, 76 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+index 568e7e7..2bede0d 100644
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -549,6 +549,30 @@ static void marvell_nfc_dump_onfi_params(struct marvell_nfc *nfc,
+ 			 "ONFI parameter CRC: calculated=%04x expected=%04x (%s)\n",
+ 			 calculated, expected,
+ 			 calculated == expected ? "valid" : "invalid");
++		if (calculated != expected)
++			return;
++
++		dev_info(nfc->dev,
++			 "ONFI identity: revision=%04x features=%04x optional-commands=%04x manufacturer=\"%.*s\" model=\"%.*s\"\n",
++			 le16_to_cpu(params->revision),
++			 le16_to_cpu(params->features),
++			 le16_to_cpu(params->opt_cmd),
++			 (int)sizeof(params->manufacturer), params->manufacturer,
++			 (int)sizeof(params->model), params->model);
++		dev_info(nfc->dev,
++			 "ONFI geometry: page=%u oob=%u pages-per-block=%u blocks-per-lun=%u luns=%u bits-per-cell=%u address-cycles=%02x\n",
++			 le32_to_cpu(params->byte_per_page),
++			 le16_to_cpu(params->spare_bytes_per_page),
++			 le32_to_cpu(params->pages_per_block),
++			 le32_to_cpu(params->blocks_per_lun),
++			 params->lun_count, params->bits_per_cell,
++			 params->addr_cycles);
++		dev_info(nfc->dev,
++			 "ONFI reliability: ecc-bits-per-512=%u bad-blocks-per-lun=%u block-endurance=%u sdr-timing-modes=%04x parameter-pages=%u\n",
++			 params->ecc_bits, le16_to_cpu(params->bb_per_lun),
++			 le16_to_cpu(params->block_endurance),
++			 le16_to_cpu(params->sdr_timing_modes),
++			 params->num_of_param_pages);
+ 	}
+ }
+ 
+@@ -1929,7 +1953,13 @@ static int marvell_nfc_monolithic_access_exec(struct nand_chip *chip,
+ 		cond_delay(nfc_op.rdy_delay_ns);
+ 	}
+ 
+-	marvell_nfc_xfer_data_pio(chip, subop, &nfc_op);
++	ret = marvell_nfc_xfer_data_pio(chip, subop, &nfc_op);
++	if (ret) {
++		if (onfi_params)
++			marvell_nfc_dump_probe_regs(nfc,
++						    "ONFI parameter PIO failed");
++		return ret;
++	}
+ 	if (onfi_params)
+ 		marvell_nfc_dump_onfi_params(nfc, subop, &nfc_op);
+ 
+@@ -2294,12 +2324,6 @@ static const struct nand_op_parser marvell_berlin2cd_op_parser = NAND_OP_PARSER(
+ 		NAND_OP_PARSER_PAT_CMD_ELEM(false),
+ 		NAND_OP_PARSER_PAT_ADDR_ELEM(false, MAX_ADDRESS_CYC_NFCV1),
+ 		NAND_OP_PARSER_PAT_DATA_IN_ELEM(false, 8)),
+-	NAND_OP_PARSER_PATTERN(
+-		marvell_nfc_erase_cmd_type_exec,
+-		NAND_OP_PARSER_PAT_CMD_ELEM(false),
+-		NAND_OP_PARSER_PAT_ADDR_ELEM(false, MAX_ADDRESS_CYC_NFCV1),
+-		NAND_OP_PARSER_PAT_CMD_ELEM(false),
+-		NAND_OP_PARSER_PAT_WAITRDY_ELEM(false)),
+ 	NAND_OP_PARSER_PATTERN(
+ 		marvell_nfc_read_status_exec,
+ 		NAND_OP_PARSER_PAT_CMD_ELEM(false),
+@@ -2308,11 +2332,46 @@ static const struct nand_op_parser marvell_berlin2cd_op_parser = NAND_OP_PARSER(
+ 		marvell_nfc_reset_cmd_type_exec,
+ 		NAND_OP_PARSER_PAT_CMD_ELEM(false),
+ 		NAND_OP_PARSER_PAT_WAITRDY_ELEM(false)),
+-	NAND_OP_PARSER_PATTERN(
+-		marvell_nfc_naked_waitrdy_exec,
+-		NAND_OP_PARSER_PAT_WAITRDY_ELEM(false)),
+ 	);
+ 
++static bool
++marvell_berlin2cd_ident_op_supported(const struct nand_operation *op)
++{
++	const struct nand_op_instr *instrs = op->instrs;
++
++	if (!op->ninstrs || instrs[0].type != NAND_OP_CMD_INSTR)
++		return false;
++
++	switch (instrs[0].ctx.cmd.opcode) {
++	case NAND_CMD_RESET:
++		return op->ninstrs == 2 &&
++		       instrs[1].type == NAND_OP_WAITRDY_INSTR;
++	case NAND_CMD_READID:
++		return op->ninstrs == 3 &&
++		       instrs[1].type == NAND_OP_ADDR_INSTR &&
++		       instrs[1].ctx.addr.naddrs == 1 &&
++		       instrs[2].type == NAND_OP_DATA_IN_INSTR &&
++		       instrs[2].ctx.data.len <= 8 &&
++		       instrs[2].ctx.data.force_8bit;
++	case NAND_CMD_STATUS:
++		return op->ninstrs == 2 &&
++		       instrs[1].type == NAND_OP_DATA_IN_INSTR &&
++		       instrs[1].ctx.data.len == 1;
++	case NAND_CMD_PARAM:
++		return op->ninstrs == 4 &&
++		       instrs[1].type == NAND_OP_ADDR_INSTR &&
++		       instrs[1].ctx.addr.naddrs == 1 &&
++		       instrs[1].ctx.addr.addrs[0] == 0 &&
++		       instrs[2].type == NAND_OP_WAITRDY_INSTR &&
++		       instrs[3].type == NAND_OP_DATA_IN_INSTR &&
++		       instrs[3].ctx.data.len ==
++					     sizeof(struct nand_onfi_params) &&
++		       instrs[3].ctx.data.force_8bit;
++	default:
++		return false;
++	}
++}
++
+ static int marvell_nfc_exec_op(struct nand_chip *chip,
+ 			       const struct nand_operation *op,
+ 			       bool check_only)
+@@ -2322,15 +2381,19 @@ static int marvell_nfc_exec_op(struct nand_chip *chip,
+ 	if (!check_only)
+ 		marvell_nfc_select_target(chip, op->cs);
+ 
+-	if (nfc->caps->probe_only)
++	if (nfc->caps->probe_only) {
++		if (!marvell_berlin2cd_ident_op_supported(op))
++			return -EOPNOTSUPP;
++
+ 		return nand_op_parser_exec_op(chip, &marvell_berlin2cd_op_parser,
+ 					      op, check_only);
+-	else if (nfc->caps->is_nfcv2 && !nfc->caps->use_nfcv1_parser)
++	} else if (nfc->caps->is_nfcv2 && !nfc->caps->use_nfcv1_parser) {
+ 		return nand_op_parser_exec_op(chip, &marvell_nfcv2_op_parser,
+ 					      op, check_only);
+-	else
++	} else {
+ 		return nand_op_parser_exec_op(chip, &marvell_nfcv1_op_parser,
+ 					      op, check_only);
++	}
+ }
+ 
+ /*
+-- 
+2.50.1

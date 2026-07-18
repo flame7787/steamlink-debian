@@ -62,20 +62,21 @@ fallback at address `0x40`, which returned the ordinary Micron ID rather than a
 JEDEC parameter signature.
 
 Patch `0003-mtd-nand-read-berlin2cd-onfi-parameters.patch` adds only the
-missing 256-byte ONFI parameter-page operation. It logs the generated command,
-the first 32 parameter bytes, and the calculated and stored ONFI CRC. A healthy
-result should contain:
+missing 256-byte ONFI parameter-page operation. Hardware returned a matching
+CRC and identified the exact device:
 
 ```text
-ONFI parameter data (256 bytes, first 32): 4f 4e 46 49 ...
-ONFI parameter CRC: calculated=.... expected=.... (valid)
+ONFI parameter CRC: calculated=6bca expected=6bca (valid)
+nand: Micron MT29F32G08CBACAWP
+nand: 4096 MiB, MLC, erase size: 1024 KiB, page size: 4096, OOB size: 224
 ```
 
-The NAND core should then report the model and geometry, followed by the
-probe-only warning. The controller must remain bound, while `/proc/mtd` remains
-empty and no `/dev/mtd*` devices are created. If the CRC is invalid or the
-operation times out, retain the complete parameter-command and final-register
-messages before changing geometry or enabling any page reads.
+The controller remained bound and printed the probe-only warning, while
+`/proc/mtd` remained empty. Patch
+`0004-mtd-nand-harden-berlin2cd-identification.patch` now restricts the
+Berlin2CD operation parser to RESET, READID, STATUS and this exact ONFI read. It
+also reports the ONFI reliability fields needed to compare the chip's ECC
+requirements with Valve's configuration before page access is implemented.
 
 For earlier READID failures, a matching Micron result is expected to begin with
 either `2c 68 04 4a` or `2c 68 04 46`. Interpret failures as follows:
@@ -94,8 +95,8 @@ pBridge or clock registers.
 
 The Valve 3.8 flash table contains Micron IDs beginning with `2c 68` for a 4 GiB,
 8-bit, 4 KiB-page device. It records 48-bit ECC per 4 KiB codeword and marks the
-device randomized. This is consistent with the reported MT29F32G08CBAC, but the
-actual Steam Link part remains unconfirmed until the new kernel logs READID.
+device randomized. ONFI identification now confirms an MT29F32G08CBACAWP with
+4 KiB pages, 224-byte OOB, 256 pages per erase block and a 4 GiB capacity.
 
 The supplied `steamlink-stock.dtb` has now been inspected. Despite its filename,
 it is the live device tree passed to the running 6.1.115 kernel, not an original
@@ -117,8 +118,8 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Confirm the ONFI parameter-page contents, CRC, model and geometry while the
-   controller remains probe-only.
+1. Capture the additional ONFI reliability fields and compare them with Valve's
+   48-bit-per-4-KiB BCH configuration.
 2. Port the pBridge channel/semaphore/BCM descriptor primitives with bounded
    polling and descriptor unit tests.
 3. Implement raw page reads, BCH strength programming and the vendor-compatible
