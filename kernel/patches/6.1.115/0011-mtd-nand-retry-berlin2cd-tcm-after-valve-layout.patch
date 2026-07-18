@@ -1,0 +1,66 @@
+The queue-31 test safely rejected the first TCM write at offset 0x07f8.
+No token was pushed, PIO NAND identification remained stable and both ONFI
+CRCs were valid. The generic register header describes a 2 KiB TCM, but the
+Berlin2CD implementation may decode its extreme tail differently.
+
+Move the reversible test to offset 0x0440, the first 64-bit word after
+Valve's complete queue 0-7 allocation. This address remains outside all
+production FIFOs while staying next to the region the vendor driver needs.
+Report both expected and actual words if readback still fails.
+
+The test remains internal and bounded. It restores the saved word and only
+pushes a queue token if both words read back exactly.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -198,10 +198,10 @@
+ #define BERLIN2CD_PB_CHANNEL_MTU_32	0x01
+ #define BERLIN2CD_PB_INIT_TIMEOUT_US	100000
+ 
+-/* Internal-only loopback uses the final TCM word and Valve-unused queue 31. */
++/* Internal-only loopback starts after Valve's TCM allocation on queue 31. */
+ #define BERLIN2CD_PB_HBO_SEMA_PUSH	0x0F80
+ #define BERLIN2CD_PB_HBO_SEMA_POP	0x0F84
+-#define BERLIN2CD_PB_TEST_TCM_OFFSET	0x07F8
++#define BERLIN2CD_PB_TEST_TCM_OFFSET	0x0440
+ #define BERLIN2CD_PB_TEST_QUEUE		31
+ #define BERLIN2CD_PB_TEST_PATTERN_LOW	0x534C5042
+ #define BERLIN2CD_PB_TEST_PATTERN_HIGH	0xA5C35A3C
+@@ -643,7 +643,8 @@
+ 	void __iomem *tcm = regs + BERLIN2CD_PB_TEST_TCM_OFFSET;
+ 	u32 command = BERLIN2CD_PB_TEST_QUEUE |
+ 		      (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
+-	u32 saved_low, saved_high, producer = 0, consumer = 0, status;
++	u32 saved_low, saved_high, actual_low, actual_high;
++	u32 producer = 0, consumer = 0, status;
+ 	bool pushed = false;
+ 	int cleanup_ret;
+ 	int ret;
+@@ -684,10 +685,16 @@
+ 		       tcm + sizeof(u32));
+ 	/* Publish the test pattern before reading it or pushing the queue. */
+ 	wmb();
+-	if (readl_relaxed(tcm) != BERLIN2CD_PB_TEST_PATTERN_LOW ||
+-	    readl_relaxed(tcm + sizeof(u32)) !=
+-					 BERLIN2CD_PB_TEST_PATTERN_HIGH) {
+-		dev_err(nfc->dev, "pBridge internal TCM readback failed\n");
++	actual_low = readl_relaxed(tcm);
++	actual_high = readl_relaxed(tcm + sizeof(u32));
++	if (actual_low != BERLIN2CD_PB_TEST_PATTERN_LOW ||
++	    actual_high != BERLIN2CD_PB_TEST_PATTERN_HIGH) {
++		dev_err(nfc->dev,
++			"pBridge internal TCM readback failed at %04x: expected=%08x:%08x actual=%08x:%08x\n",
++			BERLIN2CD_PB_TEST_TCM_OFFSET,
++			BERLIN2CD_PB_TEST_PATTERN_HIGH,
++			BERLIN2CD_PB_TEST_PATTERN_LOW,
++			actual_high, actual_low);
+ 		ret = -EIO;
+ 		goto disable;
+ 	}
+-- 
+2.50.1

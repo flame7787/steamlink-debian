@@ -256,11 +256,20 @@ requires a `0 -> 1 -> 0` producer/consumer count transition, and disables,
 clears and resets the test queue on every exit path. It does not start a dHub
 channel or access NAND.
 
-Expected new output is:
+The first hardware run rejected TCM readback at `0x07f8` before pushing a
+token. The failure path cleaned up correctly, normal PIO identification still
+found the Micron device, both ONFI CRCs remained valid and `/proc/mtd` stayed
+empty. This indicates that the generic 2 KiB TCM description cannot yet be
+assumed for Berlin2CD's extreme tail.
+
+Patch `0011-mtd-nand-retry-berlin2cd-tcm-after-valve-layout.patch` moves the
+same reversible test to `0x0440`, the first 64-bit word after Valve's queue
+allocation ends at `0x043f`. It also reports the exact expected and actual
+words if readback fails again. Expected successful output is:
 
 ```text
 pBridge internal queue after push: producer=1/... consumer=1/... data=a5c35a3c:534c5042
-pBridge internal TCM/FIFO test passed: queue=31 offset=07f8
+pBridge internal TCM/FIFO test passed: queue=31 offset=0440
 ```
 
 If the patch reports a TCM readback error or a clear, push, pop or cleanup
@@ -280,7 +289,7 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0010` and verify the internal TCM/FIFO test while PIO
+1. Boot patch `0011` and verify the internal TCM/FIFO test while PIO
    identification and ONFI CRCs remain stable.
 2. Port the pBridge descriptor primitives with bounded polling, but
    initially execute only a read-only READID transfer.
