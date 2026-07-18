@@ -17,7 +17,7 @@ on:
 
 jobs:
   build-kernel:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, watermelon]
     container: debian:bookworm-slim
     timeout-minutes: 30
     permissions:
@@ -63,7 +63,7 @@ jobs:
           path: boot/
 
   build-rootfs:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, watermelon]
     needs: build-kernel
     steps:
       - name: Install dependencies
