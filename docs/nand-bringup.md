@@ -206,6 +206,24 @@ buffer has wrapped:
 sudo journalctl -k -b --no-pager | grep -E 'passive pBridge|READID'
 ```
 
+On hardware, patch `0007` produced enough early output to wrap the 16 KiB
+kernel log before journald started, leaving only the later semaphore queries.
+Linux 6.1 now uses a 128 KiB log buffer (`CONFIG_LOG_BUF_SHIFT=17`) so the next
+normal boot retains the complete channel, queue and semaphore inventory.
+
+The retained queries showed zero producer and consumer availability for
+semaphores 2, 3, 12, 13, 19 and 25. Semaphore 24 reported producer count 1 and
+consumer count 0. In the dHub query interface, that is consistent with an
+empty depth-one completion semaphore (one producer slot is available), not a
+pending completion token. The missing channel and HBO queue queries are still
+required before initializing pBridge.
+
+Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
+device name to the driver's sysfs `unbind` file hard-locked the Steam Link
+without an Oops or timeout reaching the persistent journal. Patch `0008`
+suppresses the generic bind/unbind controls; normal boot probing remains
+unchanged.
+
 The probe patch treats Berlin2CD as NFCv2 for timing and register capabilities,
 but deliberately uses the explicit NFCv1 command parser for READID and RESET.
 It also has a dedicated identification-only cleanup path, since the ordinary

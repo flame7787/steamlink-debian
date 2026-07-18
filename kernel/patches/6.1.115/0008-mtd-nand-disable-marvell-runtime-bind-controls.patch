@@ -1,0 +1,26 @@
+The Berlin2CD probe-only controller has only been validated during boot.
+Attempting to unbind it at runtime hard-locks the Steam Link before the
+kernel can report an exception or teardown diagnostic.
+
+Suppress the generic sysfs bind and unbind controls for this experimental
+kernel. Normal probe, shutdown and power-management callbacks remain
+unchanged. This protects the device from another unsupported hot teardown
+while NAND bring-up remains boot-only.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -3698,6 +3698,7 @@ static struct platform_driver marvell_nfc_driver = {
+ 		.name		= "marvell-nfc",
+ 		.of_match_table = marvell_nfc_of_ids,
+ 		.pm		= &marvell_nfc_pm_ops,
++		.suppress_bind_attrs = true,
+ 	},
+ 	.id_table = marvell_nfc_platform_ids,
+ 	.probe = marvell_nfc_probe,
+-- 
+2.50.1
