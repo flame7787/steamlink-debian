@@ -1,0 +1,173 @@
+The Berlin2CD controller reaches NAND identification, but READID does not
+return a recognized device with the timings calculated by the mainline
+NFCv2 path. Valve's driver used fixed, conservative timing register values
+for this hardware.
+
+Force those values for the probe-only Berlin2CD path and prevent the NAND
+core from replacing them during reset. Add scoped diagnostics for clocks,
+controller state, generated READID commands, raw ID bytes and scan errors.
+The controller remains identification-only and no MTD device is exposed.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 74 ++++++++++++++++++++++++++++-
+ 1 file changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+index 1ad34c5..27d1c81 100644
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -161,6 +161,10 @@
+ #define NDTR1_WAIT_MODE		BIT(15)
+ #define NDTR1_TR(x)		(min_t(unsigned int, x, 0xFFFF) << 16)
+ 
++/* Conservative identification timings used by Valve's Berlin2CD driver. */
++#define BERLIN2CD_IDENT_NDTR0	0x84840A12
++#define BERLIN2CD_IDENT_NDTR1	0x00208662
++
+ /* NAND controller status register */
+ #define NDSR			0x14
+ #define NDSR_WRCMDREQ		BIT(0)
+@@ -369,6 +373,9 @@ static inline struct marvell_nand_chip_sel *to_nand_sel(struct marvell_nand_chip
+  * @use_dma:		Use dma for data transfers
+  * @use_nfcv1_parser:	Use the explicit NFCv1 command patterns
+  * @probe_only:	Identify the attached NAND but do not register an MTD device
++ * @fixed_ident_timings: Use controller-specific timings during identification
++ * @ident_ndtr0:	Fixed NDTR0 value used during identification
++ * @ident_ndtr1:	Fixed NDTR1 value used during identification
+  */
+ struct marvell_nfc_caps {
+ 	unsigned int max_cs_nb;
+@@ -379,6 +386,9 @@ struct marvell_nfc_caps {
+ 	bool use_dma;
+ 	bool use_nfcv1_parser;
+ 	bool probe_only;
++	bool fixed_ident_timings;
++	u32 ident_ndtr0;
++	u32 ident_ndtr1;
+ };
+ 
+ /**
+@@ -417,6 +427,20 @@ struct marvell_nfc {
+ 	u8 *dma_buf;
+ };
+ 
++static void marvell_nfc_dump_probe_regs(struct marvell_nfc *nfc,
++					const char *stage)
++{
++	if (!nfc->caps->probe_only)
++		return;
++
++	dev_info(nfc->dev,
++		 "%s: NDCR=%08x NDSR=%08x NDTR0=%08x NDTR1=%08x\n",
++		 stage, readl_relaxed(nfc->regs + NDCR),
++		 readl_relaxed(nfc->regs + NDSR),
++		 readl_relaxed(nfc->regs + NDTR0),
++		 readl_relaxed(nfc->regs + NDTR1));
++}
++
+ static inline struct marvell_nfc *to_marvell_nfc(struct nand_controller *ctrl)
+ {
+ 	return container_of(ctrl, struct marvell_nfc, controller);
+@@ -1977,11 +2001,21 @@ static int marvell_nfc_read_id_type_exec(struct nand_chip *chip,
+ 					 const struct nand_subop *subop)
+ {
+ 	struct marvell_nfc_op nfc_op;
++	struct marvell_nfc *nfc = to_marvell_nfc(chip->controller);
++	const struct nand_op_instr *data_instr;
++	unsigned int data_idx, data_len, data_off;
++	const u8 *id;
+ 	int ret;
+ 
+ 	marvell_nfc_parse_instructions(chip, subop, &nfc_op);
+ 	nfc_op.ndcb[0] &= ~NDCB0_CMD_TYPE(TYPE_READ);
+ 	nfc_op.ndcb[0] |= NDCB0_CMD_TYPE(TYPE_READ_ID);
++	if (nfc->caps->probe_only)
++		dev_info(nfc->dev,
++			 "READID command: NDCR=%08x NDSR=%08x NDCB=%08x %08x %08x %08x\n",
++			 readl_relaxed(nfc->regs + NDCR),
++			 readl_relaxed(nfc->regs + NDSR), nfc_op.ndcb[0],
++			 nfc_op.ndcb[1], nfc_op.ndcb[2], nfc_op.ndcb[3]);
+ 
+ 	ret = marvell_nfc_prepare_cmd(chip);
+ 	if (ret)
+@@ -2004,9 +2038,23 @@ static int marvell_nfc_read_id_type_exec(struct nand_chip *chip,
+ 	cond_delay(nfc_op.rdy_delay_ns);
+ 
+ 	marvell_nfc_xfer_data_pio(chip, subop, &nfc_op);
++	if (nfc->caps->probe_only) {
++		data_instr = nfc_op.data_instr;
++		data_idx = nfc_op.data_instr_idx;
++		data_len = nand_subop_get_data_len(subop, data_idx);
++		data_off = nand_subop_get_data_start_off(subop, data_idx);
++		id = data_instr->ctx.data.buf.in + data_off;
++		dev_info(nfc->dev, "READID data (%u bytes): %*ph\n",
++			 data_len, (int)min_t(unsigned int, data_len, 8), id);
++	}
++
+ 	ret = marvell_nfc_wait_cmdd(chip);
+-	if (ret)
++	if (ret) {
++		marvell_nfc_dump_probe_regs(nfc, "READID failed");
+ 		return ret;
++	}
++
++	marvell_nfc_dump_probe_regs(nfc, "READID complete");
+ 
+ 	cond_delay(nfc_op.data_delay_ns);
+ 
+@@ -2721,6 +2769,17 @@ static int marvell_nand_chip_init(struct device *dev, struct marvell_nfc *nfc,
+ 	 */
+ 	marvell_nand->ndtr0 = readl_relaxed(nfc->regs + NDTR0);
+ 	marvell_nand->ndtr1 = readl_relaxed(nfc->regs + NDTR1);
++	if (nfc->caps->fixed_ident_timings) {
++		dev_info(dev,
++			 "identification timings: boot NDTR0=%08x NDTR1=%08x; forcing NDTR0=%08x NDTR1=%08x\n",
++			 marvell_nand->ndtr0, marvell_nand->ndtr1,
++			 nfc->caps->ident_ndtr0, nfc->caps->ident_ndtr1);
++		marvell_nand->ndtr0 = nfc->caps->ident_ndtr0;
++		marvell_nand->ndtr1 = nfc->caps->ident_ndtr1;
++		writel_relaxed(marvell_nand->ndtr0, nfc->regs + NDTR0);
++		writel_relaxed(marvell_nand->ndtr1, nfc->regs + NDTR1);
++		chip->options |= NAND_KEEP_TIMINGS;
++	}
+ 
+ 	chip->options |= NAND_BUSWIDTH_AUTO;
+ 
+@@ -2729,9 +2788,11 @@ static int marvell_nand_chip_init(struct device *dev, struct marvell_nfc *nfc,
+ 	else
+ 		ret = nand_scan(chip, marvell_nand->nsels);
+ 	if (ret) {
+-		dev_err(dev, "could not scan the nand chip\n");
++		marvell_nfc_dump_probe_regs(nfc, "identification failed");
++		dev_err(dev, "could not scan the nand chip: %d\n", ret);
+ 		return ret;
+ 	}
++	marvell_nfc_dump_probe_regs(nfc, "identification complete");
+ 
+ 	/*
+ 	 * Berlin BG2CD needs its pBridge descriptor engine, BCH strength
+@@ -2941,6 +3002,12 @@ static int marvell_nfc_init(struct marvell_nfc *nfc)
+ 		marvell_nfc_init_dma(nfc);
+ 
+ 	marvell_nfc_reset(nfc);
++	if (nfc->caps->probe_only) {
++		dev_info(nfc->dev, "probe-only clocks: core=%lu Hz reg=%lu Hz\n",
++			 clk_get_rate(nfc->core_clk),
++			 nfc->reg_clk ? clk_get_rate(nfc->reg_clk) : 0);
++		marvell_nfc_dump_probe_regs(nfc, "controller reset");
++	}
+ 
+ 	return 0;
+ }
+@@ -3121,6 +3188,9 @@ static const struct marvell_nfc_caps marvell_berlin2cd_nfc_caps = {
+ 	.is_nfcv2 = true,
+ 	.use_nfcv1_parser = true,
+ 	.probe_only = true,
++	.fixed_ident_timings = true,
++	.ident_ndtr0 = BERLIN2CD_IDENT_NDTR0,
++	.ident_ndtr1 = BERLIN2CD_IDENT_NDTR1,
+ };
+ 
+ static const struct marvell_nfc_caps marvell_pxa3xx_nfc_caps = {
+-- 
+2.50.1

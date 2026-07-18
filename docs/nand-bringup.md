@@ -32,9 +32,32 @@ then prints the probe-only warning. `/proc/mtd` should contain only its header.
 No `nanddump` package is required at this stage because no MTD character device
 is intentionally created.
 
-If probing times out, retain the complete `dmesg` from that boot. The next check
-will be clock/reset state and whether READID itself must run through pBridge
-channel 3. Do not use `devmem` to write NFC, pBridge or clock registers.
+The first hardware test reached `nand_scan` but reported `No NAND device found`.
+After probe unwound, debugfs showed the expected NFC clocks at 212.5 MHz and
+NFC-ECC clock at 283.33 MHz. The platform device was left unbound, with the
+clocks disabled and IRQ released, as expected for a failed probe.
+
+The follow-up diagnostic patch forces the timing values used by Valve's driver
+before the first RESET/READID and prevents the generic NAND timing setup from
+overwriting them:
+
+```text
+NDTR0CS0 = 0x84840a12
+NDTR1CS0 = 0x00208662
+```
+
+It logs both READID transfers. A matching Micron result is expected to begin
+with either `2c 68 04 4a` or `2c 68 04 46`. Interpret failures as follows:
+
+- all `ff`: check chip select, pin mux, power and external signaling;
+- all `00` or repeated words: check FIFO and controller mode;
+- different first and second IDs: check timing stability;
+- a controller timeout: use the named WRCMDREQ, RDDREQ, CMDD or ready/busy
+  stage to investigate that handshake;
+- a stable but unknown ID: add its confirmed geometry in a later patch.
+
+Retain the complete `dmesg` from each test. Do not use `devmem` to write NFC,
+pBridge or clock registers.
 
 ## Evidence already available
 
