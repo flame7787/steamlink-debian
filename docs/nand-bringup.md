@@ -276,16 +276,27 @@ and both ONFI CRCs still completed normally.
 Patch `0012-mtd-nand-test-berlin2cd-implemented-fifo.patch` repeats the test on
 implemented queue 7. It first stops channel 3, temporarily configures its data
 queue at depth one, and restores the exact Valve queue base/depth before
-restarting the channel. Expected successful output is:
+restarting the channel.
+
+Hardware confirmed that queue 7 and TCM offset `0x0440` are implemented, but
+the diagnostic reported a producer-side timeout. That result did not establish
+that the consumer stayed at zero: the helper returned after polling the
+producer and never sampled the consumer output. PIO READID, both ONFI CRCs and
+cleanup remained healthy, and `/proc/mtd` stayed empty.
+
+Patch `0013-mtd-nand-poll-berlin2cd-fifo-consumer.patch` follows Valve's HBO
+access pattern. It polls the consumer query that indicates readable FIFO data,
+then samples the producer query for diagnostics. Expected successful output is:
 
 ```text
-pBridge internal queue after push: producer=1/... consumer=1/... data=a5c35a3c:534c5042
+pBridge internal queue after push: producer=<diagnostic>/... consumer=1/... data=a5c35a3c:534c5042
 pBridge internal TCM/FIFO test passed: queue=7 offset=0440
 ```
 
-If the patch reports a TCM readback error or a clear, push, pop or cleanup
-timeout, retain the complete boot log. PIO READID and both ONFI CRCs should
-still complete, but descriptor work must not proceed.
+If the patch reports that the consumer did not observe the push or pop, retain
+the complete boot log. A zero consumer count after this patch is conclusive,
+rather than an uninitialized diagnostic value. PIO READID and both ONFI CRCs
+should still complete, but descriptor work must not proceed.
 
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
@@ -300,7 +311,7 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0012` and verify the internal TCM/FIFO test while PIO
+1. Boot patch `0013` and verify the internal TCM/FIFO test while PIO
    identification and ONFI CRCs remain stable.
 2. Port the pBridge descriptor primitives with bounded polling, but
    initially execute only a read-only READID transfer.

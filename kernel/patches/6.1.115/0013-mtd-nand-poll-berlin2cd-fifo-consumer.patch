@@ -1,0 +1,69 @@
+The queue 7 hardware test reached TCM and issued the semaphore push, but
+its diagnostic helper polled the producer query first. When that query did
+not change, the helper returned without ever reading the consumer query, so
+the reported consumer value was only its zero-initialized output variable.
+
+Valve's HBO helper uses the producer query to check write-side space and
+the consumer query to determine whether FIFO data can be read. Poll the
+consumer view for the push and pop transitions, then always sample the
+producer view for diagnostics. This establishes whether the token reached
+the read side without weakening any timeout or cleanup behavior.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 19 ++++++-------------
+ 1 file changed, 6 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -611,25 +611,18 @@ static int berlin2cd_wait_test_queue(struct marvell_nfc *nfc, u16 expected,
+ 				     u32 *producer, u32 *consumer)
+ {
+ 	void __iomem *regs = nfc->pbridge_regs;
++	const u32 query = BERLIN2CD_PB_HBO_SEMA_QUERY;
++	const u8 queue = BERLIN2CD_PB_TEST_QUEUE;
+ 	u32 value;
+ 	int ret;
+ 
+-	ret = readl_relaxed_poll_timeout(regs +
+-		BERLIN2CD_PB_HBO_SEMA_QUERY +
+-		(BERLIN2CD_PB_TEST_QUEUE << 2), value,
+-		(value & 0xffff) == expected, 1,
+-		BERLIN2CD_PB_INIT_TIMEOUT_US);
+-	*producer = value;
+-	if (ret)
+-		return ret;
+-
+-	ret = readl_relaxed_poll_timeout(regs +
+-		BERLIN2CD_PB_HBO_SEMA_QUERY +
+-		(BERLIN2CD_PB_TEST_QUEUE << 2) +
++	ret = readl_relaxed_poll_timeout(regs +
++		query + (queue << 2) +
+ 		BERLIN2CD_PB_SEMA_CONSUMER, value,
+ 		(value & 0xffff) == expected, 1,
+ 		BERLIN2CD_PB_INIT_TIMEOUT_US);
+ 	*consumer = value;
++	*producer = marvell_berlin2cd_pbridge_sema_query(regs, query, queue, false);
+ 
+ 	return ret;
+ }
+@@ -711,7 +704,7 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 	ret = berlin2cd_wait_test_queue(nfc, 1, &producer, &consumer);
+ 	if (ret) {
+ 		dev_err(nfc->dev,
+-			"pBridge internal queue push timed out: producer=%u/%u consumer=%u/%u\n",
++			"pBridge internal queue consumer did not observe push: producer=%u/%u consumer=%u/%u\n",
+ 			producer & 0xffff, producer >> 16,
+ 			consumer & 0xffff, consumer >> 16);
+ 		goto disable;
+@@ -728,7 +721,7 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 	ret = berlin2cd_wait_test_queue(nfc, 0, &producer, &consumer);
+ 	if (ret) {
+ 		dev_err(nfc->dev,
+-			"pBridge internal queue pop timed out: producer=%u/%u consumer=%u/%u\n",
++			"pBridge internal queue consumer did not observe pop: producer=%u/%u consumer=%u/%u\n",
+ 			producer & 0xffff, producer >> 16,
+ 			consumer & 0xffff, consumer >> 16);
+ 		goto disable;
+-- 
+2.50.1
