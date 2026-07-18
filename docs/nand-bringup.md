@@ -203,7 +203,7 @@ Retrieve the complete early output from the journal if the 16 KiB kernel ring
 buffer has wrapped:
 
 ```sh
-sudo journalctl -k -b --no-pager | grep -E 'passive pBridge|READID'
+sudo journalctl -k -b --no-pager | grep -E 'pBridge|READID|ONFI'
 ```
 
 On hardware, patch `0007` produced enough early output to wrap the 16 KiB
@@ -211,12 +211,42 @@ kernel log before journald started, leaving only the later semaphore queries.
 Linux 6.1 now uses a 128 KiB log buffer (`CONFIG_LOG_BUF_SHIFT=17`) so the next
 normal boot retains the complete channel, queue and semaphore inventory.
 
-The retained queries showed zero producer and consumer availability for
-semaphores 2, 3, 12, 13, 19 and 25. Semaphore 24 reported producer count 1 and
-consumer count 0. In the dHub query interface, that is consistent with an
-empty depth-one completion semaphore (one producer slot is available), not a
-pending completion token. The missing channel and HBO queue queries are still
-required before initializing pBridge.
+The retained inventory confirmed that the dHub is quiescent: busy and pending
+were zero, all four channels reported state `0002`, and all eight HBO busy bits
+were clear. Every queue had zero producer and consumer availability. Its
+matching producer/consumer pointers retained the values `0/16`, `1/5`, `0/0`
+and `0/7` for the four command/data pairs. Those residues are compatible with
+Valve's queue depths but do not prove configuration because FIFO base and
+depth registers are write-only.
+
+The dHub semaphores likewise had zero producer and consumer availability,
+except semaphore 24, which reported producer count 1 and consumer count 0.
+That query is consistent with an empty depth-one completion semaphore: one
+producer slot is available. No outstanding NAND transaction was visible, so
+explicit bounded reinitialization is safer than relying on unverifiable
+bootloader state.
+
+Patch `0009-mtd-nand-initialize-berlin2cd-pbridge.patch` records that inherited
+state, refuses to proceed if dHub or HBO is active, and then reproduces Valve's
+four-channel setup. It clears all eight FIFOs with a 100 ms bounded wait,
+programs the BCM base, 32-byte MTUs, FIFO bases/depths and nine depth-one dHub
+semaphores, then records the initialized state. It does not touch TCM, enable
+the completion interrupt, submit descriptors or transfer NAND data.
+
+Expected output includes:
+
+```text
+inherited pBridge status: ... dHub-busy=00000000 dHub-pending=00000000
+pBridge initialized: four 32-byte-MTU channels, eight Valve-layout FIFOs, nine depth-one semaphores
+initialized pBridge HBO busy: 00000000
+```
+
+After initialization, empty command queues should expose two producer slots
+and empty data queues 32 producer slots, with zero consumer slots and reset
+pointers. Each configured dHub semaphore should expose one producer slot and
+zero consumer slots. NAND READID and both ONFI CRCs must remain unchanged, and
+`/proc/mtd` must remain empty. If the patch reports an active engine or a FIFO
+clear timeout, retain the entire boot log and do not continue to descriptors.
 
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
@@ -231,19 +261,18 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0007` and record all channel, queue and semaphore query results.
-2. Decide whether the inherited pBridge state can be reused or needs a bounded
-   reset and explicit Valve-compatible initialization.
-3. Port the pBridge channel/semaphore/BCM descriptor primitives with bounded
-   polling, but initially execute only a read-only READID transfer.
-4. Implement repeated raw page reads with BCH disabled and explicitly test
+1. Boot patch `0009` and verify the inherited-to-initialized pBridge transition
+   while PIO identification and ONFI CRCs remain stable.
+2. Port the pBridge TCM and descriptor primitives with bounded polling, but
+   initially execute only a read-only READID transfer.
+3. Implement repeated raw page reads with BCH disabled and explicitly test
    randomizer behavior before decoding production data.
-5. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
+4. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
    raw captures before registering any MTD.
-6. Register a read-only MTD and validate full-device hashes, bad-block markers
+5. Register a read-only MTD and validate full-device hashes, bad-block markers
    and ECC statistics.
-7. Add read-retry support if the confirmed ID requires it.
-8. Put erase/program support behind an explicit Kconfig opt-in, then test only
+6. Add read-retry support if the confirmed ID requires it.
+7. Put erase/program support behind an explicit Kconfig opt-in, then test only
    on disposable blocks after verified USB recovery.
 
 GPU work is separate. Etnaviv is already upstream in modern Linux and the GC1000

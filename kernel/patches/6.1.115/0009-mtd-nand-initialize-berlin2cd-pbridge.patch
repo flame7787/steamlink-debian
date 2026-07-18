@@ -1,0 +1,248 @@
+The retained pBridge inventory shows that all four dHub channels and all
+eight HBO queues are idle. Their inherited producer and consumer pointers
+also match Valve's four-channel FIFO allocation, but the configuration
+registers are write-only and cannot be verified directly.
+
+Initialize that known layout explicitly before continuing the existing PIO
+identification probe. Refuse initialization if any dHub or HBO activity is
+visible, stop and clear every queue, and bound the clear wait to 100 ms.
+Configure Valve's FIFO bases and depths, 32-byte channel MTUs and BCM base.
+Also configure the nine depth-one semaphores used by the vendor NFC path.
+Report the complete state both before and after initialization.
+
+This remains an initialization-only milestone. It does not touch pBridge
+TCM, enable a completion interrupt, submit a descriptor, transfer NAND page
+data, enable DMA or register an MTD.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 149 +++++++++++++++++++++++++++++-------
+ 1 file changed, 131 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -182,6 +182,22 @@
+ #define BERLIN2CD_PB_DHUB_CHANNEL_STATE	0x1740
+ #define BERLIN2CD_PB_SEMA_CONSUMER	BIT(7)
+ 
++/* Valve's four-channel pBridge FIFO layout. */
++#define BERLIN2CD_PB_DHUB_SEMA_CFG	0x0900
++#define BERLIN2CD_PB_HBO_SEMA_CFG	0x0D00
++#define BERLIN2CD_PB_HBO_FIFO_CFG	0x1000
++#define BERLIN2CD_PB_DHUB_CHANNEL_CFG	0x1300
++#define BERLIN2CD_PB_SEMA_STRIDE		0x14
++#define BERLIN2CD_PB_FIFO_STRIDE		0x10
++#define BERLIN2CD_PB_CHANNEL_STRIDE	0x10
++#define BERLIN2CD_PB_FIFO_START		0x04
++#define BERLIN2CD_PB_FIFO_CLEAR		0x08
++#define BERLIN2CD_PB_CHANNEL_START	0x04
++#define BERLIN2CD_PB_CHANNELS		4
++#define BERLIN2CD_PB_QUEUES		8
++#define BERLIN2CD_PB_CHANNEL_MTU_32	0x01
++#define BERLIN2CD_PB_INIT_TIMEOUT_US	100000
++
+ /* NAND controller status register */
+ #define NDSR			0x14
+ #define NDSR_WRCMDREQ		BIT(0)
+@@ -455,6 +471,19 @@
+ 	const char *name;
+ };
+ 
++struct marvell_berlin2cd_pbridge_queue {
++	u16 base;
++	u16 depth;
++};
++
++static const struct marvell_berlin2cd_pbridge_queue
++marvell_berlin2cd_pbridge_queues[] = {
++	{   0,  2 }, {  16, 32 },
++	{ 272,  2 }, { 288, 32 },
++	{ 544,  2 }, { 560, 32 },
++	{ 816,  2 }, { 832, 32 },
++};
++
+ static const struct marvell_berlin2cd_pbridge_sema
+ marvell_berlin2cd_pbridge_semas[] = {
+ 	{ 0, "channel-0" },
+@@ -481,7 +510,8 @@
+ }
+ 
+ static void marvell_berlin2cd_dump_pbridge_sema(struct marvell_nfc *nfc,
+-		const struct marvell_berlin2cd_pbridge_sema *sema)
++		const struct marvell_berlin2cd_pbridge_sema *sema,
++		const char *stage)
+ {
+ 	void __iomem *regs = nfc->pbridge_regs;
+ 	u32 producer, consumer;
+@@ -492,14 +522,16 @@
+ 			BERLIN2CD_PB_DHUB_SEMA_QUERY, sema->id, true);
+ 
+ 	dev_info(nfc->dev,
+-		 "passive pBridge semaphore %u (%s): producer count=%u pointer=%u; consumer count=%u pointer=%u\n",
+-		 sema->id, sema->name, producer & 0xffff, producer >> 16,
++		 "%s pBridge semaphore %u (%s): producer count=%u pointer=%u; consumer count=%u pointer=%u\n",
++		 stage, sema->id, sema->name, producer & 0xffff,
++		 producer >> 16,
+ 		 consumer & 0xffff, consumer >> 16);
+ }
+ 
+ static void marvell_berlin2cd_dump_pbridge_channel(struct marvell_nfc *nfc,
+ 						   unsigned int channel,
+-						   u32 hbo_busy)
++						   u32 hbo_busy,
++						   const char *stage)
+ {
+ 	void __iomem *regs = nfc->pbridge_regs;
+ 	u8 command_queue = channel * 2;
+@@ -519,18 +551,20 @@
+ 			BERLIN2CD_PB_HBO_SEMA_QUERY, data_queue, true);
+ 
+ 	dev_info(nfc->dev,
+-		 "passive pBridge channel %u: state=%04x HBO-busy command=%u data=%u\n",
+-		 channel, state & 0xffff, !!(hbo_busy & BIT(command_queue)),
++		 "%s pBridge channel %u: state=%04x HBO-busy command=%u data=%u\n",
++		 stage, channel, state & 0xffff,
++		 !!(hbo_busy & BIT(command_queue)),
+ 		 !!(hbo_busy & BIT(data_queue)));
+ 	dev_info(nfc->dev,
+-		 "passive pBridge channel %u queues: command %u producer=%u/%u consumer=%u/%u; data %u producer=%u/%u consumer=%u/%u\n",
+-		 channel, command_queue, cmd_producer & 0xffff,
++		 "%s pBridge channel %u queues: command %u producer=%u/%u consumer=%u/%u; data %u producer=%u/%u consumer=%u/%u\n",
++		 stage, channel, command_queue, cmd_producer & 0xffff,
+ 		 cmd_producer >> 16, cmd_consumer & 0xffff, cmd_consumer >> 16,
+ 		 data_queue, data_producer & 0xffff, data_producer >> 16,
+ 		 data_consumer & 0xffff, data_consumer >> 16);
+ }
+ 
+-static void marvell_berlin2cd_dump_pbridge(struct marvell_nfc *nfc)
++static void marvell_berlin2cd_dump_pbridge(struct marvell_nfc *nfc,
++					   const char *stage)
+ {
+ 	void __iomem *regs = nfc->pbridge_regs;
+ 	u32 hbo_busy;
+@@ -540,27 +574,105 @@
+ 		return;
+ 
+ 	dev_info(nfc->dev,
+-		 "passive pBridge status: clock=%lu Hz sem-empty=%08x sem-full=%08x dHub-busy=%08x dHub-pending=%08x\n",
+-		 clk_get_rate(nfc->pbridge_clk),
++		 "%s pBridge status: clock=%lu Hz sem-empty=%08x sem-full=%08x dHub-busy=%08x dHub-pending=%08x\n",
++		 stage, clk_get_rate(nfc->pbridge_clk),
+ 		 readl_relaxed(regs + BERLIN2CD_PB_SEMA_EMPTY),
+ 		 readl_relaxed(regs + BERLIN2CD_PB_SEMA_FULL),
+ 		 readl_relaxed(regs + BERLIN2CD_PB_DHUB_BUSY),
+ 		 readl_relaxed(regs + BERLIN2CD_PB_DHUB_PENDING));
+ 	dev_info(nfc->dev,
+-		 "passive pBridge control: bus-reset-enable=%08x bus-reset-done=%08x BCM-error=%08x BCM-base=%08x\n",
+-		 readl_relaxed(regs + BERLIN2CD_PB_BUS_RESET_ENABLE),
++		 "%s pBridge control: bus-reset-enable=%08x bus-reset-done=%08x BCM-error=%08x BCM-base=%08x\n",
++		 stage, readl_relaxed(regs + BERLIN2CD_PB_BUS_RESET_ENABLE),
+ 		 readl_relaxed(regs + BERLIN2CD_PB_BUS_RESET_DONE),
+ 		 readl_relaxed(regs + BERLIN2CD_PB_BCM_ERROR),
+ 		 readl_relaxed(regs + BERLIN2CD_PB_BCM_BASE));
+ 
+ 	hbo_busy = readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY);
+-	dev_info(nfc->dev, "passive pBridge HBO busy: %08x\n", hbo_busy);
+-	for (i = 0; i < 4; i++)
+-		marvell_berlin2cd_dump_pbridge_channel(nfc, i, hbo_busy);
++	dev_info(nfc->dev, "%s pBridge HBO busy: %08x\n", stage, hbo_busy);
++	for (i = 0; i < BERLIN2CD_PB_CHANNELS; i++)
++		marvell_berlin2cd_dump_pbridge_channel(nfc, i, hbo_busy, stage);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(marvell_berlin2cd_pbridge_semas); i++)
+ 		marvell_berlin2cd_dump_pbridge_sema(
+-			nfc, &marvell_berlin2cd_pbridge_semas[i]);
++			nfc, &marvell_berlin2cd_pbridge_semas[i], stage);
++}
++
++static void marvell_berlin2cd_init_pbridge(struct marvell_nfc *nfc)
++{
++	void __iomem *regs = nfc->pbridge_regs;
++	u32 status;
++	unsigned int i;
++	int ret;
++
++	if (!nfc->caps->has_pbridge)
++		return;
++
++	status = readl_relaxed(regs + BERLIN2CD_PB_DHUB_BUSY) |
++		 readl_relaxed(regs + BERLIN2CD_PB_DHUB_PENDING) |
++		 readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY);
++	if (status) {
++		dev_warn(nfc->dev,
++			 "pBridge initialization skipped: engine is active (%08x)\n",
++			 status);
++		return;
++	}
++
++	for (i = 0; i < BERLIN2CD_PB_CHANNELS; i++)
++		writel_relaxed(0, regs + BERLIN2CD_PB_DHUB_CHANNEL_CFG +
++			       i * BERLIN2CD_PB_CHANNEL_STRIDE +
++			       BERLIN2CD_PB_CHANNEL_START);
++
++	for (i = 0; i < BERLIN2CD_PB_QUEUES; i++) {
++		void __iomem *fifo = regs + BERLIN2CD_PB_HBO_FIFO_CFG +
++				     i * BERLIN2CD_PB_FIFO_STRIDE;
++
++		writel_relaxed(0, fifo + BERLIN2CD_PB_FIFO_START);
++		writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_CLEAR);
++	}
++
++	ret = readl_relaxed_poll_timeout(regs + BERLIN2CD_PB_HBO_BUSY,
++					 status, !(status & GENMASK(7, 0)), 1,
++					 BERLIN2CD_PB_INIT_TIMEOUT_US);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge FIFO clear timed out: HBO-busy=%08x\n",
++			status);
++		return;
++	}
++
++	writel_relaxed(0xf0000000, regs + BERLIN2CD_PB_BCM_BASE);
++
++	for (i = 0; i < BERLIN2CD_PB_CHANNELS; i++)
++		writel_relaxed(BERLIN2CD_PB_CHANNEL_MTU_32,
++			       regs + BERLIN2CD_PB_DHUB_CHANNEL_CFG +
++			       i * BERLIN2CD_PB_CHANNEL_STRIDE);
++
++	for (i = 0; i < ARRAY_SIZE(marvell_berlin2cd_pbridge_queues); i++) {
++		void __iomem *fifo = regs + BERLIN2CD_PB_HBO_FIFO_CFG +
++				     i * BERLIN2CD_PB_FIFO_STRIDE;
++
++		writel_relaxed(marvell_berlin2cd_pbridge_queues[i].base, fifo);
++		writel_relaxed(marvell_berlin2cd_pbridge_queues[i].depth,
++			       regs + BERLIN2CD_PB_HBO_SEMA_CFG +
++			       i * BERLIN2CD_PB_SEMA_STRIDE);
++		writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_START);
++	}
++
++	for (i = 0; i < ARRAY_SIZE(marvell_berlin2cd_pbridge_semas); i++)
++		writel_relaxed(1, regs + BERLIN2CD_PB_DHUB_SEMA_CFG +
++			       marvell_berlin2cd_pbridge_semas[i].id *
++			       BERLIN2CD_PB_SEMA_STRIDE);
++
++	for (i = 0; i < BERLIN2CD_PB_CHANNELS; i++)
++		writel_relaxed(1, regs + BERLIN2CD_PB_DHUB_CHANNEL_CFG +
++			       i * BERLIN2CD_PB_CHANNEL_STRIDE +
++			       BERLIN2CD_PB_CHANNEL_START);
++
++	/* Make every configuration write visible before querying the engine. */
++	wmb();
++	dev_info(nfc->dev,
++		 "pBridge initialized: four 32-byte-MTU channels, eight Valve-layout FIFOs, nine depth-one semaphores\n");
++	marvell_berlin2cd_dump_pbridge(nfc, "initialized");
+ }
+ 
+ static void marvell_nfc_dump_probe_regs(struct marvell_nfc *nfc,
+@@ -3505,7 +3617,8 @@
+ 	if (ret)
+ 		goto unprepare_reg_clk;
+ 
+-	marvell_berlin2cd_dump_pbridge(nfc);
++	marvell_berlin2cd_dump_pbridge(nfc, "inherited");
++	marvell_berlin2cd_init_pbridge(nfc);
+ 
+ 	marvell_nfc_disable_int(nfc, NDCR_ALL_INT);
+ 	marvell_nfc_clear_int(nfc, NDCR_ALL_INT);
+-- 
+2.50.1
