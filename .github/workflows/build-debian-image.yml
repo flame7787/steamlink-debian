@@ -94,8 +94,9 @@ jobs:
       - name: Create RootFS tarball
         run: |
           docker load -i steamlink-debian.tar
-          docker create -t -i --name steamlink-debian-rootfs steamlink-debian:latest
-          docker export steamlink-debian-rootfs -o rootfs.tar
+          container_id=$(docker create steamlink-debian:latest)
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker export "$container_id" -o rootfs.tar
 
       - name: Upload RootFS tarball
         uses: actions/upload-artifact@v4
