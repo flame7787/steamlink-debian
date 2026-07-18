@@ -8,7 +8,7 @@ mkdir boot
 cd steamlink-sdk
 source setenv.sh
 cd ../linux-$KERNEL_VERSION
-make oldconfig
+make olddefconfig
 make -j$(nproc)
 make modules
 mkdir /tmp/build-modules

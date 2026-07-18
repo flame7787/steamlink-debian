@@ -1,3 +1,8 @@
+## fork
+
+The build uses Debian 13 and Linux 6.1.115. Docker is included in the generated image. The kernel config adds Linux namespaces, cgroups, seccomp, overlayfs, veth/bridge networking, nftables, and iptables, required for Docker.
+
+
 # steamlink-debian
 
 This repository provides a way to run Debian GNU/Linux on a Valve Steam Link device using a USB stick.
