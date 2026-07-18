@@ -309,23 +309,52 @@ Patch `0014-mtd-nand-test-berlin2cd-dhub-semaphore.patch` tests the other
 SemaHub inside pBridge before repeating the HBO queue test. It borrows the
 already configured depth-one dHub semaphore 25, performs a bounded `0 -> 1 ->
 0` push/pop transition and clears its latched empty/full status afterward. It
-also clears and samples the dHub and HBO test bits in the condition-latch
-registers around each operation and verifies that the latches accepted their
-write-one-to-clear commands before PUSH. After a successful clear, a set
-`full` event with zero query counts would prove that the PUSH reached the
-SemaHub even though its query path did not reflect the token; no event and zero
-counts points earlier in the write or configuration path. A latch-clear
-warning instead identifies the common status-write path itself as suspect. It
-does not submit a descriptor or issue a NAND command. Expected success is:
+also clears and samples the dHub and HBO test bits in the condition registers
+around each operation. It does not submit a descriptor or issue a NAND
+command. Expected dHub success is:
 
 ```text
-pBridge dHub semaphore after push: id=25 producer=1/... consumer=1/... events empty=0 full=1
+pBridge dHub semaphore after push: id=25 producer=1/... consumer=1/... events empty=1 full=1
 pBridge dHub semaphore push/pop test passed: id=25 events empty=1 full=1
 ```
 
 If dHub semaphore 25 passes while queue 7 still fails, the fault is confined
 to the HBO FIFO controller or its configuration. If both pushes fail, focus on
 the common SemaHub write path, clock/reset state or access semantics.
+
+Hardware running patch `0014` completed the dHub semaphore transition with
+matching producer and consumer counts of one after PUSH and zero after POP.
+This proves the shared pBridge clock, MMIO write path, PUSH/POP encoding and
+query-map interpretation. HBO queue 7 still ended with both query counts at
+zero, but both its empty and full conditions were set after PUSH. That pattern
+is compatible with a token becoming full and then being consumed before the
+100 ms poll ended.
+
+The patch's two "condition latches did not clear" warnings are not evidence of
+a failed write. The empty condition immediately reasserts while a depth-one
+semaphore has a zero count, so requiring both empty and full to remain clear
+was invalid. The full condition must be cleared and checked independently
+before it can prove a post-PUSH transition.
+
+Patch `0015-mtd-nand-isolate-berlin2cd-hbo-queue.patch` corrects that check and
+tests the transient-consumption hypothesis. It follows Valve's full channel 3
+stop sequence: disable command queue 6, disable and clear the channel, wait
+for dHub busy and pending to clear, then clear queues 6 and 7. It captures both
+HBO query windows immediately after PUSH and again after the bounded poll,
+then restores both FIFOs and the channel. Expected output now contains:
+
+```text
+pBridge dHub semaphore after push: id=25 producer=1/... consumer=1/... events empty=1 full=1
+pBridge internal queue after push: first producer=1/... consumer=1/...; final producer=1/... consumer=1/... ...
+```
+
+If the first HBO counts are one but the final counts are zero, a consumer is
+draining queue 7. If the isolated test passes, the earlier START=0 write did
+not fully quiesce channel 3 without a channel CLEAR. If both first and final
+counts remain zero while `full=1` and no pre-PUSH full-condition warning
+appears, the PUSH reached HBO but either vanished before the first MMIO read or
+the HBO count-query semantics differ on Berlin2CD. A full-condition warning
+makes the post-PUSH full bit ambiguous and should be retained in the log.
 
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
@@ -340,8 +369,8 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0014` and compare the dHub semaphore result with the HBO queue
-   result while PIO identification and ONFI CRCs remain stable.
+1. Boot patch `0015` and compare the immediate and final HBO queue queries
+   after the complete channel-clear sequence.
 2. Resolve the failing SemaHub layer before porting pBridge descriptors.
 3. Port the pBridge descriptor primitives with bounded polling, but
    initially execute only a read-only READID transfer.
