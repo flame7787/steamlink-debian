@@ -1,0 +1,196 @@
+The explicit pBridge initialization resets every configured FIFO pointer.
+It leaves the engine idle while NAND PIO identification remains stable.
+Before submitting a dHub descriptor, verify the remaining internal
+primitives without causing any external bus or NAND activity.
+
+Use HBO queue 31, outside Valve's NFC queue 0-7 allocation, and the final
+64-bit word of the 2 KiB pBridge TCM. Configure the queue at depth one.
+Write and read back a fixed TCM pattern, then push and pop one semaphore
+token. Require both query sides to make the expected 0-1-0 transition.
+Every wait is bounded to 100 ms.
+
+Always disable and clear the test queue, reset its depth, and restore the
+saved TCM word. No dHub channel is started for queue 31. This test does not
+submit a descriptor, access NFC registers, issue a NAND command, enable an
+interrupt or register an MTD.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 150 ++++++++++++++++++++++++++++
+ 1 file changed, 150 insertions(+)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -198,6 +198,15 @@
+ #define BERLIN2CD_PB_CHANNEL_MTU_32	0x01
+ #define BERLIN2CD_PB_INIT_TIMEOUT_US	100000
+ 
++/* Internal-only loopback uses the final TCM word and Valve-unused queue 31. */
++#define BERLIN2CD_PB_HBO_SEMA_PUSH	0x0F80
++#define BERLIN2CD_PB_HBO_SEMA_POP	0x0F84
++#define BERLIN2CD_PB_TEST_TCM_OFFSET	0x07F8
++#define BERLIN2CD_PB_TEST_QUEUE		31
++#define BERLIN2CD_PB_TEST_PATTERN_LOW	0x534C5042
++#define BERLIN2CD_PB_TEST_PATTERN_HIGH	0xA5C35A3C
++#define BERLIN2CD_PB_SEMA_DELTA_SHIFT	8
++
+ /* NAND controller status register */
+ #define NDSR			0x14
+ #define NDSR_WRCMDREQ		BIT(0)
+@@ -597,6 +606,146 @@
+ 			nfc, &marvell_berlin2cd_pbridge_semas[i], stage);
+ }
+ 
++static int berlin2cd_wait_test_queue(struct marvell_nfc *nfc, u16 expected,
++				     u32 *producer, u32 *consumer)
++{
++	void __iomem *regs = nfc->pbridge_regs;
++	u32 value;
++	int ret;
++
++	ret = readl_relaxed_poll_timeout(regs +
++		BERLIN2CD_PB_HBO_SEMA_QUERY +
++		(BERLIN2CD_PB_TEST_QUEUE << 2), value,
++		(value & 0xffff) == expected, 1,
++		BERLIN2CD_PB_INIT_TIMEOUT_US);
++	*producer = value;
++	if (ret)
++		return ret;
++
++	ret = readl_relaxed_poll_timeout(regs +
++		BERLIN2CD_PB_HBO_SEMA_QUERY +
++		(BERLIN2CD_PB_TEST_QUEUE << 2) +
++		BERLIN2CD_PB_SEMA_CONSUMER, value,
++		(value & 0xffff) == expected, 1,
++		BERLIN2CD_PB_INIT_TIMEOUT_US);
++	*consumer = value;
++
++	return ret;
++}
++
++static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
++{
++	void __iomem *regs = nfc->pbridge_regs;
++	void __iomem *fifo = regs + BERLIN2CD_PB_HBO_FIFO_CFG +
++		BERLIN2CD_PB_TEST_QUEUE * BERLIN2CD_PB_FIFO_STRIDE;
++	void __iomem *sema = regs + BERLIN2CD_PB_HBO_SEMA_CFG +
++		BERLIN2CD_PB_TEST_QUEUE * BERLIN2CD_PB_SEMA_STRIDE;
++	void __iomem *tcm = regs + BERLIN2CD_PB_TEST_TCM_OFFSET;
++	u32 command = BERLIN2CD_PB_TEST_QUEUE |
++		      (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
++	u32 saved_low, saved_high, producer = 0, consumer = 0, status;
++	bool pushed = false;
++	int cleanup_ret;
++	int ret;
++
++	saved_low = readl_relaxed(tcm);
++	saved_high = readl_relaxed(tcm + sizeof(u32));
++
++	writel_relaxed(0, fifo + BERLIN2CD_PB_FIFO_START);
++	writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_CLEAR);
++	ret = readl_relaxed_poll_timeout(regs + BERLIN2CD_PB_HBO_BUSY,
++					 status,
++					 !(status & BIT(BERLIN2CD_PB_TEST_QUEUE)),
++					 1, BERLIN2CD_PB_INIT_TIMEOUT_US);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge internal test queue clear timed out: HBO-busy=%08x\n",
++			status);
++		goto restore;
++	}
++
++	writel_relaxed(BERLIN2CD_PB_TEST_TCM_OFFSET, fifo);
++	writel_relaxed(1, sema);
++	writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_START);
++	/* Publish queue configuration before querying it. */
++	wmb();
++
++	ret = berlin2cd_wait_test_queue(nfc, 0, &producer, &consumer);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge internal test queue did not start empty: producer=%u/%u consumer=%u/%u\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16);
++		goto disable;
++	}
++
++	writel_relaxed(BERLIN2CD_PB_TEST_PATTERN_LOW, tcm);
++	writel_relaxed(BERLIN2CD_PB_TEST_PATTERN_HIGH,
++		       tcm + sizeof(u32));
++	/* Publish the test pattern before reading it or pushing the queue. */
++	wmb();
++	if (readl_relaxed(tcm) != BERLIN2CD_PB_TEST_PATTERN_LOW ||
++	    readl_relaxed(tcm + sizeof(u32)) !=
++					 BERLIN2CD_PB_TEST_PATTERN_HIGH) {
++		dev_err(nfc->dev, "pBridge internal TCM readback failed\n");
++		ret = -EIO;
++		goto disable;
++	}
++
++	writel(command, regs + BERLIN2CD_PB_HBO_SEMA_PUSH);
++	pushed = true;
++	ret = berlin2cd_wait_test_queue(nfc, 1, &producer, &consumer);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge internal queue push timed out: producer=%u/%u consumer=%u/%u\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16);
++		goto disable;
++	}
++
++	dev_info(nfc->dev,
++		 "pBridge internal queue after push: producer=%u/%u consumer=%u/%u data=%08x:%08x\n",
++		 producer & 0xffff, producer >> 16,
++		 consumer & 0xffff, consumer >> 16,
++		 readl_relaxed(tcm + sizeof(u32)), readl_relaxed(tcm));
++
++	writel(command, regs + BERLIN2CD_PB_HBO_SEMA_POP);
++	pushed = false;
++	ret = berlin2cd_wait_test_queue(nfc, 0, &producer, &consumer);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge internal queue pop timed out: producer=%u/%u consumer=%u/%u\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16);
++		goto disable;
++	}
++
++	dev_info(nfc->dev,
++		 "pBridge internal TCM/FIFO test passed: queue=%u offset=%04x\n",
++		 BERLIN2CD_PB_TEST_QUEUE, BERLIN2CD_PB_TEST_TCM_OFFSET);
++
++disable:
++	if (pushed)
++		writel(command, regs + BERLIN2CD_PB_HBO_SEMA_POP);
++	writel_relaxed(0, fifo + BERLIN2CD_PB_FIFO_START);
++	writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_CLEAR);
++	cleanup_ret = readl_relaxed_poll_timeout(regs +
++		BERLIN2CD_PB_HBO_BUSY, status,
++		!(status & BIT(BERLIN2CD_PB_TEST_QUEUE)), 1,
++		BERLIN2CD_PB_INIT_TIMEOUT_US);
++	writel_relaxed(0, sema);
++	if (cleanup_ret)
++		dev_err(nfc->dev,
++			"pBridge internal test cleanup timed out: HBO-busy=%08x\n",
++			status);
++
++restore:
++	writel_relaxed(saved_low, tcm);
++	writel_relaxed(saved_high, tcm + sizeof(u32));
++	/* Complete restoration before normal probe activity resumes. */
++	wmb();
++}
++
+ static void marvell_berlin2cd_init_pbridge(struct marvell_nfc *nfc)
+ {
+ 	void __iomem *regs = nfc->pbridge_regs;
+@@ -673,6 +822,7 @@
+ 	dev_info(nfc->dev,
+ 		 "pBridge initialized: four 32-byte-MTU channels, eight Valve-layout FIFOs, nine depth-one semaphores\n");
+ 	marvell_berlin2cd_dump_pbridge(nfc, "initialized");
++	marvell_berlin2cd_test_pbridge(nfc);
+ }
+ 
+ static void marvell_nfc_dump_probe_regs(struct marvell_nfc *nfc,
+-- 
+2.50.1

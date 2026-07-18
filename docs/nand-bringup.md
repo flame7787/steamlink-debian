@@ -219,12 +219,13 @@ and `0/7` for the four command/data pairs. Those residues are compatible with
 Valve's queue depths but do not prove configuration because FIFO base and
 depth registers are write-only.
 
-The dHub semaphores likewise had zero producer and consumer availability,
-except semaphore 24, which reported producer count 1 and consumer count 0.
-That query is consistent with an empty depth-one completion semaphore: one
-producer slot is available. No outstanding NAND transaction was visible, so
-explicit bounded reinitialization is safer than relying on unverifiable
-bootloader state.
+The dHub semaphores likewise usually had zero producer and consumer counts.
+Semaphore 24 reported producer count 1 and consumer count 0 on one boot, then
+zero on a later boot. Valve's HBO helpers treat these query counts as queue
+occupancy visible to each side, not free capacity. The one-sided value and
+changing FIFO pointers are therefore bootloader residue rather than a
+verifiable empty configuration. No active NAND transaction was visible, so
+explicit bounded reinitialization is safer than reusing that state.
 
 Patch `0009-mtd-nand-initialize-berlin2cd-pbridge.patch` records that inherited
 state, refuses to proceed if dHub or HBO is active, and then reproduces Valve's
@@ -241,12 +242,30 @@ pBridge initialized: four 32-byte-MTU channels, eight Valve-layout FIFOs, nine d
 initialized pBridge HBO busy: 00000000
 ```
 
-After initialization, empty command queues should expose two producer slots
-and empty data queues 32 producer slots, with zero consumer slots and reset
-pointers. Each configured dHub semaphore should expose one producer slot and
-zero consumer slots. NAND READID and both ONFI CRCs must remain unchanged, and
-`/proc/mtd` must remain empty. If the patch reports an active engine or a FIFO
-clear timeout, retain the entire boot log and do not continue to descriptors.
+Hardware completed initialization without a timeout. All producer and consumer
+counts were zero, all FIFO pointers reset to zero, and dHub/HBO remained idle.
+That is the correct empty state; configured depths are write-only and do not
+appear as free-slot counts in the query windows. NAND READID and both ONFI CRCs
+remained unchanged, and `/proc/mtd` remained empty.
+
+Patch `0010-mtd-nand-test-berlin2cd-pbridge-internally.patch` validates the
+internal TCM, FIFO semaphore and query paths before any descriptor is used. It
+uses queue 31, outside Valve's NFC queues 0 through 7, at depth one and the
+final 64-bit TCM word at offset `0x07f8`. The test saves and restores that word,
+requires a `0 -> 1 -> 0` producer/consumer count transition, and disables,
+clears and resets the test queue on every exit path. It does not start a dHub
+channel or access NAND.
+
+Expected new output is:
+
+```text
+pBridge internal queue after push: producer=1/... consumer=1/... data=a5c35a3c:534c5042
+pBridge internal TCM/FIFO test passed: queue=31 offset=07f8
+```
+
+If the patch reports a TCM readback error or a clear, push, pop or cleanup
+timeout, retain the complete boot log. PIO READID and both ONFI CRCs should
+still complete, but descriptor work must not proceed.
 
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
@@ -261,9 +280,9 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0009` and verify the inherited-to-initialized pBridge transition
-   while PIO identification and ONFI CRCs remain stable.
-2. Port the pBridge TCM and descriptor primitives with bounded polling, but
+1. Boot patch `0010` and verify the internal TCM/FIFO test while PIO
+   identification and ONFI CRCs remain stable.
+2. Port the pBridge descriptor primitives with bounded polling, but
    initially execute only a read-only READID transfer.
 3. Implement repeated raw page reads with BCH disabled and explicitly test
    randomizer behavior before decoding production data.
