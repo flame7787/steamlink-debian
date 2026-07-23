@@ -181,8 +181,40 @@ The first READID implementation remains probe-only:
 - no unbounded waits or automatic retries;
 - no runtime bind/unbind controls.
 
+The first `0021` hardware run completed the descriptor and returned
+`2c 68 04 4a a9 00 00 ff`. The later PIO transfer returned the same bytes and
+the driver reported a matching `2c 68 04 4a` prefix. Queue and semaphore
+counters reconciled and `BCM-error` remained zero.
+
+## Milestone 3: repeated page-zero prefix
+
+Patch `0022-mtd-nand-test-berlin2cd-page-prefix-descriptor.patch` deliberately
+does not jump directly to Valve's multi-kilobyte, multi-chunk read function.
+After identification confirms the exact Micron geometry, it performs two
+32-byte transfers from column zero of page zero. This is exactly one channel
+MTU and isolates the large-page command/address path from full-page chunking.
+
+The test derives the page-operation `NDCR` from the saved identification state
+and Valve's settings: large-page mode, row-address start and 256 pages per
+block are enabled, while controller DMA, ECC, BCH and spare transfer are
+disabled. It sends a monolithic `READ0`/`READSTART`, five zero address cycles
+and `NDCB3=32`.
+
+Each pass independently requires empty semaphores 12, 13 and 24, an idle
+pBridge and an idle NAND controller. After completion it pops semaphore 24,
+requires `CMDD` and `PAGED` without ECC status, checks all pBridge engines and
+restores the original NFC registers only after the transport is idle. The
+second result must match the first and neither may retain the `a5` destination
+sentinel.
+
+This remains a read-only probe diagnostic. Page zero is in the vendor
+randomizer-bypass range, no OOB is transferred, no ECC result is trusted and
+no MTD is registered. Any uncertain submitted descriptor stops the experiment
+without reset, retry, a later PIO command or buffer release.
+
 ## Deferred work
 
-Raw page reads need a separate design for 4 KiB page transfers, randomizer
-state, BCH-24-per-1024-byte correction, OOB layout, bad-block markers, and read
-retry. None of those should be mixed into descriptor transport validation.
+Full raw page reads still need a separate design for 4 KiB transfers,
+randomizer state, BCH-24-per-1024-byte correction, OOB layout, bad-block
+markers, and read retry. None of those should be mixed into the page-prefix
+transport validation.

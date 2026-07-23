@@ -526,6 +526,42 @@ The coherent descriptor and destination remain managed for the lifetime of
 the device, so a timed-out engine is never raced by a PIO command or freed
 buffer.
 
+The first `0021` hardware run completed exactly as designed:
+
+```text
+pBridge READID descriptor completed: ...
+pBridge READID data (8 bytes): 2c 68 04 4a a9 00 00 ff
+READID data (8 bytes): 2c 68 04 4a a9 00 00 ff
+pBridge/PIO READID prefixes match: 2c 68 04 4a
+```
+
+The command and data semaphores were consumed, queue 6 advanced normally,
+`ND_RUN` cleared, and `BCM-error` remained zero. This validates coherent
+pBridge data transfer from `NDDB`, not merely descriptor execution.
+
+Patch `0022-mtd-nand-test-berlin2cd-page-prefix-descriptor.patch` adds a
+smaller boundary before a full raw-page implementation. After exact Micron
+geometry has been identified, it reads the first 32 bytes of page zero twice.
+The operation:
+
+- requires one CS0, an 8-bit bus, 4 KiB pages, 224-byte OOB, 1 MiB erase
+  blocks and five address cycles;
+- programs the large-page, 256-pages-per-block and row-address-start NDCR
+  fields used by Valve;
+- disables controller DMA, ECC, BCH and spare transfer;
+- issues one monolithic `READ0`/`READSTART` with a 32-byte length override;
+- requires `CMDD`, `PAGED`, no ECC status, empty NFC semaphores, idle pBridge
+  engines and no `BCM-error`;
+- restores the identification-era `NDCR` and `NDECCCTRL` only after the
+  transport is proven idle;
+- repeats the transfer and requires both 32-byte results to match.
+
+Page zero lies in Valve's randomizer-bypass range, so a matching result proves
+the page command, five-cycle address and one-MTU data path only. It does not
+validate production-data randomization, OOB layout or BCH correction. A
+submitted descriptor that times out is not reset or retried, and its managed
+buffers are not freed.
+
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
 without an Oops or timeout reaching the persistent journal. Patch `0008`
@@ -539,9 +575,11 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0021` and require matching pBridge and PIO READID prefixes,
-   empty NFC semaphores, an idle pBridge and no `BCM-error`.
-2. Implement repeated raw page reads with BCH disabled and explicitly test
+1. Boot patch `0022` and require two matching, non-sentinel page-zero
+   prefixes, `CMDD` plus `PAGED`, restored controller registers, empty NFC
+   semaphores, an idle pBridge and no `BCM-error`.
+2. Expand the proven prefix operation into repeated raw page reads with BCH
+   disabled and explicitly test
    randomizer behavior before decoding production data.
 3. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
    raw captures before registering any MTD.
