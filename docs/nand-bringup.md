@@ -404,6 +404,32 @@ the dHub/2D channel block. If neither pointer advances, HBO ignores PUSH while
 the FIFO is disabled and the test must instead hold the associated channel in
 a stronger reset state.
 
+Hardware running patch `0017` retained the token exactly as expected:
+producer count/pointer `1/1`, consumer count/pointer `1/0`, channel state
+`0001` throughout and no full condition at depth two. Cleanup restored the
+normal queue and channel configuration, after which PIO READID and both ONFI
+parameter-page CRCs remained valid. This confirms the HBO queue and dHub
+consumer path are behaving normally.
+
+Patch `0018-mtd-nand-test-berlin2cd-null-descriptor.patch` is the first
+coherent-memory fetch test. It submits one four-byte BCM `NULL` instruction on
+channel 3's normal command queue 6, requests completion on dHub semaphore 3,
+and verifies that the four NAND control/timing registers did not change.
+Expected success is:
+
+```text
+pBridge submitting NULL descriptor: dma=... descriptor=0000000f queue=6 slot=0 command=10000004:...
+pBridge NULL descriptor completed: dma=... queue producer=0/1 consumer=0/1 semaphore producer=1/0 consumer=1/0 events empty=1 full=1
+pBridge coherent NULL descriptor test passed without NAND access
+```
+
+The descriptor is `0x0000000f`, matching the generated vendor `BCMINSFMT`
+definition: `NULL` is a four-byte instruction with its header in bits 3
+through 0. The dHub command is still one 64-bit queue entry and requests a
+four-byte transfer. The test runs only if patch `0017`'s disabled-queue test
+passes, uses bounded polling, never accesses NAND media and leaves MTD
+registration disabled.
+
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
 without an Oops or timeout reaching the persistent journal. Patch `0008`
@@ -417,21 +443,23 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0017` and determine whether FIFO `START=0` prevents the
-   observed immediate HBO consumer transition.
-2. Resolve or account for the unexpected HBO consumer before porting pBridge
-   descriptors.
-3. Port the pBridge descriptor primitives with bounded polling, but
-   initially execute only a read-only READID transfer.
-4. Implement repeated raw page reads with BCH disabled and explicitly test
+1. Boot patch `0018` and verify the coherent BCM `NULL` descriptor completes
+   without changing NAND registers.
+2. Port the first pBridge NAND descriptor with bounded polling, initially
+   executing only a read-only READID transfer.
+3. Implement repeated raw page reads with BCH disabled and explicitly test
    randomizer behavior before decoding production data.
-5. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
+4. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
    raw captures before registering any MTD.
-6. Register a read-only MTD and validate full-device hashes, bad-block markers
+5. Register a read-only MTD and validate full-device hashes, bad-block markers
    and ECC statistics.
-7. Add read-retry support if the confirmed ID requires it.
-8. Put erase/program support behind an explicit Kconfig opt-in, then test only
+6. Add read-retry support if the confirmed ID requires it.
+7. Put erase/program support behind an explicit Kconfig opt-in, then test only
    on disposable blocks after verified USB recovery.
+
+The staged transport implementation, beginning with a NAND-independent BCM
+`NULL` descriptor, is detailed in
+[pbridge-descriptor-plan.md](pbridge-descriptor-plan.md).
 
 GPU work is separate. Etnaviv is already upstream in modern Linux and the GC1000
 register block does not replace the NAND pBridge engine.

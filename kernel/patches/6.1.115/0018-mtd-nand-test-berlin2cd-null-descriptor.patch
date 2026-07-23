@@ -1,0 +1,319 @@
+From: Steam Link Debian maintainers
+Subject: [PATCH] mtd: nand: test Berlin2CD coherent NULL descriptor
+
+Hardware testing confirms that Berlin2CD's depth-two HBO queue retains a
+token while disabled and consumes it normally while enabled.  Exercise the
+next transport layer without touching the NAND controller or flash.
+
+Allocate one 32-bit-addressable coherent BCM NULL instruction, submit its
+four-byte descriptor through Valve's channel 3 command queue, and request a
+completion on the channel semaphore.  Gate the test on the earlier internal
+TCM/FIFO check and use bounded polling throughout.
+
+Validate queue consumption, channel completion, idle engine state, a clear
+BCM error register, and unchanged NAND control and timing registers.  Log a
+full channel snapshot on failure and keep the managed coherent allocation
+alive for the platform device in case a timed-out engine completes late.
+
+MTD registration remains disabled and no NAND command, page, OOB, erase or
+program operation is issued.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 252 +++++++++++++++++++++++++++-
+ 1 file changed, 249 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -214,9 +214,13 @@
+ #define BERLIN2CD_PB_TEST_COMMAND_QUEUE	6
+ #define BERLIN2CD_PB_TEST_CHANNEL	3
+ #define BERLIN2CD_PB_TEST_DHUB_SEMA	25
++#define BERLIN2CD_PB_TEST_COMPLETION_SEMA 3
+ #define BERLIN2CD_PB_TEST_PATTERN_LOW	0x534C5042
+ #define BERLIN2CD_PB_TEST_PATTERN_HIGH	0xA5C35A3C
+ #define BERLIN2CD_PB_SEMA_DELTA_SHIFT	8
++#define BERLIN2CD_PB_DHUB_CMD_INTERRUPT	BIT(28)
++#define BERLIN2CD_PB_DHUB_CMD_SIZE	4
++#define BERLIN2CD_PB_BCM_NULL		0x0000000F
+ 
+ /* NAND controller status register */
+ #define NDSR			0x14
+@@ -741,7 +745,7 @@
+ 					 BERLIN2CD_PB_DHUB_SEMA_FULL, id);
+ }
+ 
+-static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
++static bool marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ {
+ 	const struct marvell_berlin2cd_pbridge_queue *queue;
+ 	void __iomem *regs = nfc->pbridge_regs;
+@@ -947,7 +951,7 @@
+ 	/* Restore Valve's queue before normal probe activity resumes. */
+ 	wmb();
+ 	if (cleanup_ret)
+-		return;
++		return false;
+ 
+ 	writel_relaxed(queue->base, fifo);
+ 	writel_relaxed(queue->depth, sema);
+@@ -963,6 +967,247 @@
+ 			 BERLIN2CD_PB_TEST_QUEUE,
+ 			 BERLIN2CD_PB_TEST_QUEUE_DEPTH,
+ 			 BERLIN2CD_PB_TEST_TCM_OFFSET);
++
++	return passed;
++}
++
++static void marvell_berlin2cd_test_null_descriptor(struct marvell_nfc *nfc)
++{
++	const struct marvell_berlin2cd_pbridge_queue *queue;
++	const u32 channel_bit = BIT(BERLIN2CD_PB_TEST_CHANNEL);
++	const u32 hbo_query = BERLIN2CD_PB_HBO_SEMA_QUERY;
++	const u32 hbo_busy_mask =
++		BIT(BERLIN2CD_PB_TEST_COMMAND_QUEUE) |
++		BIT(BERLIN2CD_PB_TEST_QUEUE);
++	const u8 cmd_queue = BERLIN2CD_PB_TEST_COMMAND_QUEUE;
++	const u8 test_channel = BERLIN2CD_PB_TEST_CHANNEL;
++	void __iomem *regs = nfc->pbridge_regs;
++	void __iomem *tcm;
++	dma_addr_t descriptor_dma;
++	__le32 *descriptor;
++	u32 queue_producer = 0, queue_consumer = 0;
++	u32 sema_producer = 0, sema_consumer = 0;
++	u32 empty_event = 0, full_event = 0;
++	u32 ndcr, ndsr, ndtr0, ndtr1;
++	u32 command, command_header, status;
++	bool validated = false;
++	int ret;
++
++	queue = marvell_berlin2cd_pbridge_queues +
++		BERLIN2CD_PB_TEST_COMMAND_QUEUE;
++
++	ret = dma_set_mask_and_coherent(nfc->dev, DMA_BIT_MASK(32));
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor cannot set 32-bit DMA mask: %d\n",
++			ret);
++		return;
++	}
++
++	descriptor = dmam_alloc_coherent(nfc->dev, sizeof(*descriptor),
++					 &descriptor_dma, GFP_KERNEL);
++	if (!descriptor) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor allocation failed\n");
++		return;
++	}
++	if (upper_32_bits(descriptor_dma) ||
++	    !IS_ALIGNED(descriptor_dma, sizeof(*descriptor))) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor has unusable DMA address: %pad\n",
++			&descriptor_dma);
++		return;
++	}
++
++	status = readl_relaxed(regs + BERLIN2CD_PB_DHUB_BUSY) |
++		 readl_relaxed(regs + BERLIN2CD_PB_DHUB_PENDING) |
++		 readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY);
++	if (status || readl_relaxed(regs + BERLIN2CD_PB_BCM_ERROR)) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor requires an idle engine: dHub-busy=%08x dHub-pending=%08x HBO-busy=%08x BCM-error=%08x\n",
++			readl_relaxed(regs + BERLIN2CD_PB_DHUB_BUSY),
++			readl_relaxed(regs + BERLIN2CD_PB_DHUB_PENDING),
++			readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY),
++			readl_relaxed(regs + BERLIN2CD_PB_BCM_ERROR));
++		return;
++	}
++
++	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_HBO_SEMA_QUERY,
++				       BERLIN2CD_PB_TEST_COMMAND_QUEUE, 0,
++				       &queue_producer, &queue_consumer);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor command queue is not empty: producer=%u/%u consumer=%u/%u\n",
++			queue_producer & 0xffff, queue_producer >> 16,
++			queue_consumer & 0xffff, queue_consumer >> 16);
++		return;
++	}
++
++	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_DHUB_SEMA_QUERY,
++				       BERLIN2CD_PB_TEST_COMPLETION_SEMA, 0,
++				       &sema_producer, &sema_consumer);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor completion semaphore is not empty: producer=%u/%u consumer=%u/%u\n",
++			sema_producer & 0xffff, sema_producer >> 16,
++			sema_consumer & 0xffff, sema_consumer >> 16);
++		return;
++	}
++
++	if (!berlin2cd_clear_full_event(regs,
++					BERLIN2CD_PB_HBO_SEMA_FULL,
++					BERLIN2CD_PB_TEST_COMMAND_QUEUE))
++		dev_warn(nfc->dev,
++			 "pBridge NULL descriptor command queue full condition did not clear\n");
++	if (!berlin2cd_clear_full_event(regs,
++					BERLIN2CD_PB_DHUB_SEMA_FULL,
++					BERLIN2CD_PB_TEST_COMPLETION_SEMA))
++		dev_warn(nfc->dev,
++			 "pBridge NULL descriptor completion full condition did not clear\n");
++
++	ndcr = readl_relaxed(nfc->regs + NDCR);
++	ndsr = readl_relaxed(nfc->regs + NDSR);
++	ndtr0 = readl_relaxed(nfc->regs + NDTR0);
++	ndtr1 = readl_relaxed(nfc->regs + NDTR1);
++
++	*descriptor = cpu_to_le32(BERLIN2CD_PB_BCM_NULL);
++	dma_wmb();
++
++	tcm = regs + queue->base +
++	      (queue_producer >> 16) * BERLIN2CD_PB_DHUB_CMD_SIZE;
++	writel_relaxed(lower_32_bits(descriptor_dma), tcm);
++	command_header = BERLIN2CD_PB_DHUB_CMD_INTERRUPT |
++			 BERLIN2CD_PB_DHUB_CMD_SIZE;
++	writel_relaxed(command_header, tcm + sizeof(u32));
++	/* Publish the descriptor and queue entry before announcing it to HBO. */
++	wmb();
++
++	dev_info(nfc->dev,
++		 "pBridge submitting NULL descriptor: dma=%pad descriptor=%08x queue=%u slot=%u command=%08x:%08x\n",
++		 &descriptor_dma, BERLIN2CD_PB_BCM_NULL,
++		 BERLIN2CD_PB_TEST_COMMAND_QUEUE, queue_producer >> 16,
++		 command_header,
++		 lower_32_bits(descriptor_dma));
++
++	command = BERLIN2CD_PB_TEST_COMMAND_QUEUE |
++		  (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
++	writel(command, regs + BERLIN2CD_PB_HBO_SEMA_PUSH);
++
++	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_DHUB_SEMA_QUERY,
++				       BERLIN2CD_PB_TEST_COMPLETION_SEMA, 1,
++				       &sema_producer, &sema_consumer);
++	queue_consumer = marvell_berlin2cd_pbridge_sema_query(regs, hbo_query,
++							      cmd_queue, true);
++	queue_producer = marvell_berlin2cd_pbridge_sema_query(regs, hbo_query,
++							      cmd_queue, false);
++	berlin2cd_read_semaphore_events(regs,
++					BERLIN2CD_PB_DHUB_SEMA_EMPTY,
++					BERLIN2CD_PB_DHUB_SEMA_FULL,
++					BERLIN2CD_PB_TEST_COMPLETION_SEMA,
++					&empty_event, &full_event);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor completion timed out: queue producer=%u/%u consumer=%u/%u; semaphore producer=%u/%u consumer=%u/%u events empty=%u full=%u dHub-busy=%08x dHub-pending=%08x HBO-busy=%08x BCM-error=%08x\n",
++			queue_producer & 0xffff, queue_producer >> 16,
++			queue_consumer & 0xffff, queue_consumer >> 16,
++			sema_producer & 0xffff, sema_producer >> 16,
++			sema_consumer & 0xffff, sema_consumer >> 16,
++			empty_event, full_event,
++			readl_relaxed(regs + BERLIN2CD_PB_DHUB_BUSY),
++			readl_relaxed(regs + BERLIN2CD_PB_DHUB_PENDING),
++			readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY),
++			readl_relaxed(regs + BERLIN2CD_PB_BCM_ERROR));
++		status = readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY);
++		marvell_berlin2cd_dump_pbridge_channel(nfc, test_channel,
++						       status, "NULL timeout");
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor timeout state: BCM-base=%08x NAND=%08x/%08x/%08x/%08x expected=%08x/%08x/%08x/%08x\n",
++			readl_relaxed(regs + BERLIN2CD_PB_BCM_BASE),
++			readl_relaxed(nfc->regs + NDCR),
++			readl_relaxed(nfc->regs + NDSR),
++			readl_relaxed(nfc->regs + NDTR0),
++			readl_relaxed(nfc->regs + NDTR1),
++			ndcr, ndsr, ndtr0, ndtr1);
++		return;
++	}
++
++	ret = readl_relaxed_poll_timeout(regs + BERLIN2CD_PB_DHUB_BUSY,
++					 status, !(status & channel_bit), 1,
++					 BERLIN2CD_PB_INIT_TIMEOUT_US);
++	if (!ret)
++		ret = readl_relaxed_poll_timeout(regs +
++						 BERLIN2CD_PB_DHUB_PENDING,
++						 status,
++						 !(status & channel_bit), 1,
++						 BERLIN2CD_PB_INIT_TIMEOUT_US);
++	if (!ret)
++		ret = readl_relaxed_poll_timeout(regs + BERLIN2CD_PB_HBO_BUSY,
++						 status,
++						 !(status & hbo_busy_mask), 1,
++						 BERLIN2CD_PB_INIT_TIMEOUT_US);
++	if (ret || readl_relaxed(regs + BERLIN2CD_PB_BCM_ERROR) ||
++	    (queue_producer & 0xffff) || (queue_consumer & 0xffff) ||
++	    (queue_producer >> 16) != 1 || (queue_consumer >> 16) != 1 ||
++	    readl_relaxed(nfc->regs + NDCR) != ndcr ||
++	    readl_relaxed(nfc->regs + NDSR) != ndsr ||
++	    readl_relaxed(nfc->regs + NDTR0) != ndtr0 ||
++	    readl_relaxed(nfc->regs + NDTR1) != ndtr1) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor validation failed: queue producer=%u/%u consumer=%u/%u dHub-busy=%08x dHub-pending=%08x HBO-busy=%08x BCM-error=%08x NAND=%08x/%08x/%08x/%08x expected=%08x/%08x/%08x/%08x\n",
++			queue_producer & 0xffff, queue_producer >> 16,
++			queue_consumer & 0xffff, queue_consumer >> 16,
++			readl_relaxed(regs + BERLIN2CD_PB_DHUB_BUSY),
++			readl_relaxed(regs + BERLIN2CD_PB_DHUB_PENDING),
++			readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY),
++			readl_relaxed(regs + BERLIN2CD_PB_BCM_ERROR),
++			readl_relaxed(nfc->regs + NDCR),
++			readl_relaxed(nfc->regs + NDSR),
++			readl_relaxed(nfc->regs + NDTR0),
++			readl_relaxed(nfc->regs + NDTR1),
++			ndcr, ndsr, ndtr0, ndtr1);
++		status = readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY);
++		marvell_berlin2cd_dump_pbridge_channel(nfc, test_channel,
++						       status,
++						       "NULL validation");
++		goto pop_completion;
++	}
++
++	dev_info(nfc->dev,
++		 "pBridge NULL descriptor completed: dma=%pad queue producer=%u/%u consumer=%u/%u semaphore producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
++		 &descriptor_dma,
++		 queue_producer & 0xffff, queue_producer >> 16,
++		 queue_consumer & 0xffff, queue_consumer >> 16,
++		 sema_producer & 0xffff, sema_producer >> 16,
++		 sema_consumer & 0xffff, sema_consumer >> 16,
++		 empty_event, full_event);
++	validated = true;
++
++pop_completion:
++	command = BERLIN2CD_PB_TEST_COMPLETION_SEMA |
++		  (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
++	writel(command, regs + BERLIN2CD_PB_DHUB_SEMA_POP);
++	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_DHUB_SEMA_QUERY,
++				       BERLIN2CD_PB_TEST_COMPLETION_SEMA, 0,
++				       &sema_producer, &sema_consumer);
++	berlin2cd_clear_semaphore_events(regs,
++					 BERLIN2CD_PB_DHUB_SEMA_EMPTY,
++					 BERLIN2CD_PB_DHUB_SEMA_FULL,
++					 BERLIN2CD_PB_TEST_COMPLETION_SEMA);
++	berlin2cd_clear_semaphore_events(regs,
++					 BERLIN2CD_PB_HBO_SEMA_EMPTY,
++					 BERLIN2CD_PB_HBO_SEMA_FULL,
++					 BERLIN2CD_PB_TEST_COMMAND_QUEUE);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge NULL descriptor completion pop timed out: producer=%u/%u consumer=%u/%u\n",
++			sema_producer & 0xffff, sema_producer >> 16,
++			sema_consumer & 0xffff, sema_consumer >> 16);
++		return;
++	}
++
++	if (validated)
++		dev_info(nfc->dev,
++			 "pBridge coherent NULL descriptor test passed without NAND access\n");
+ }
+ 
+ static void marvell_berlin2cd_init_pbridge(struct marvell_nfc *nfc)
+@@ -1042,7 +1287,8 @@
+ 		 "pBridge initialized: four 32-byte-MTU channels, eight Valve-layout FIFOs, nine depth-one semaphores\n");
+ 	marvell_berlin2cd_dump_pbridge(nfc, "initialized");
+ 	marvell_berlin2cd_test_dhub_semaphore(nfc);
+-	marvell_berlin2cd_test_pbridge(nfc);
++	if (marvell_berlin2cd_test_pbridge(nfc))
++		marvell_berlin2cd_test_null_descriptor(nfc);
+ }
+ 
+ static void marvell_nfc_dump_probe_regs(struct marvell_nfc *nfc,
+-- 
+2.50.1
