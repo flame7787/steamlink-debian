@@ -132,6 +132,12 @@ interchangeable for a dHub-generated completion. Patch `0020` accepts zero
 consumer occupancy regardless of the residual producer count; completion and
 POP waits continue to use only the consumer query.
 
+The second `0020` hardware run completed both `CFGW` descriptors. `NDTR0`
+changed from `84840a12` to `84840a13` and back, queue 6 producer and consumer
+pointers advanced together, every engine returned idle, and `BCM-error`
+remained zero. PIO READID and both ONFI CRCs remained valid. No additional
+transport prerequisite is needed before Milestone 2.
+
 ## Milestone 2: read-only READID descriptor
 
 Only after the NULL descriptor completes repeatably should channel 3 execute a
@@ -152,6 +158,20 @@ with the modern driver's already validated NFCv1 parser, including `LEN_OVRD`
 and `NDCB3=8`. This requires a fourth `CFGW`, making the modern descriptor
 eight instructions. Compare the DMA result against a PIO READID in the same
 boot and require two matching `2c 68 04 4a` prefixes.
+
+Patch `0021-mtd-nand-test-berlin2cd-readid-descriptor.patch` implements this
+as a single 64-byte descriptor after the NFC reset and before NAND-core
+identification. It first requires semaphores 12, 13 and 24 to be empty, then
+sets `ND_RUN` and waits for semaphore 12 to reach one before making queue 6
+visible. This prevents the descriptor from being submitted if the NFC command
+handshake is not connected.
+
+On descriptor completion, the test waits for semaphore 24, copies the coherent
+result, pops semaphore 24, and requires semaphores 12 and 13 plus every pBridge
+engine to return idle. It also requires CS0 `CMDD`, a cleared `ND_RUN`, and
+`BCM-error=0`. Any failure reuses the existing transport gate: the driver
+remains bound, NAND-core PIO identification is skipped, and no automatic
+reset, retry, buffer release or MTD registration occurs.
 
 The first READID implementation remains probe-only:
 

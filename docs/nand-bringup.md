@@ -489,6 +489,43 @@ consumer count, and both values remain in timeout diagnostics. The failed run
 issued no `CFGW` or NAND command, and the fail-safe correctly left the driver
 bound while skipping PIO identification.
 
+The next hardware run validated patch `0020` completely:
+
+```text
+pBridge CFGW timing-test descriptor completed: ...
+pBridge CFGW timing test observed NDTR0 transition: 84840a12 -> 84840a13
+pBridge CFGW timing-restore descriptor completed: ...
+pBridge reversible CFGW register test passed without a NAND command
+READID data (8 bytes): 2c 68 04 4a a9 00 00 ff
+ONFI extended parameter CRC: calculated=71bc expected=71bc (valid)
+```
+
+Both command-queue pointers advanced together, each completion reached the
+consumer query, `BCM-error` remained zero, and PIO identification was unchanged
+after the temporary timing write. This completes the NAND-independent and
+controller-register pBridge transport milestones.
+
+Patch `0021-mtd-nand-test-berlin2cd-readid-descriptor.patch` adds the first
+read-only NAND transaction through pBridge. After the controller reset it:
+
+- builds `10610090 00000000 00000000 00000008` from the modern READID
+  definitions rather than copying Valve's command word;
+- sets `ND_RUN`, requires semaphore 12 to report the NFC command request, and
+  submits one bounded 64-byte BCM function;
+- writes the four NDCB words through `CFGW`, waits on semaphore 13, and copies
+  eight bytes from `NDDB` to 32-bit-addressable coherent memory;
+- requires and pops data-completion semaphore 24, requires semaphores 12 and
+  13 to return empty, and checks `CMDD`, every pBridge busy bit and
+  `BCM-error`;
+- accepts only the known Micron `2c 68 04 4a` prefix and compares it with the
+  later eight-byte PIO READID in the same boot.
+
+If any precondition, handshake, descriptor, completion or ID check fails, the
+existing probe gate keeps the driver bound and skips NAND-core identification.
+The coherent descriptor and destination remain managed for the lifetime of
+the device, so a timed-out engine is never raced by a PIO command or freed
+buffer.
+
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
 without an Oops or timeout reaching the persistent journal. Patch `0008`
@@ -502,18 +539,16 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot through patch `0020` and verify both reversible `CFGW` descriptors
-   complete without changing any register except the temporary `NDTR0` bit.
-2. Port the first pBridge NAND descriptor with bounded polling, initially
-   executing only a read-only READID transfer.
-3. Implement repeated raw page reads with BCH disabled and explicitly test
+1. Boot patch `0021` and require matching pBridge and PIO READID prefixes,
+   empty NFC semaphores, an idle pBridge and no `BCM-error`.
+2. Implement repeated raw page reads with BCH disabled and explicitly test
    randomizer behavior before decoding production data.
-4. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
+3. Add 48-bit-per-2-KiB BCH handling and compare corrected reads against the
    raw captures before registering any MTD.
-5. Register a read-only MTD and validate full-device hashes, bad-block markers
+4. Register a read-only MTD and validate full-device hashes, bad-block markers
    and ECC statistics.
-6. Add read-retry support if the confirmed ID requires it.
-7. Put erase/program support behind an explicit Kconfig opt-in, then test only
+5. Add read-retry support if the confirmed ID requires it.
+6. Put erase/program support behind an explicit Kconfig opt-in, then test only
    on disposable blocks after verified USB recovery.
 
 The staged transport implementation, beginning with a NAND-independent BCM

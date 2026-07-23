@@ -1,0 +1,367 @@
+The Berlin2CD pBridge now completes coherent NULL descriptors and
+reversible CFGW register writes on hardware. Exercise the first read-only
+NAND function without exposing page data or an MTD.
+
+Build an eight-instruction, 64-byte BCM function from the modern driver's
+READID definitions. Require the NFC command handshake before submission,
+write all four NDCB words, wait for the data handshake, and copy eight
+bytes from NDDB into 32-bit-addressable coherent memory.
+
+Bound every semaphore and engine wait. Require and pop the NFC data
+completion semaphore, require the command and data semaphores to return
+empty, and check ND_RUN, CMDD, pBridge busy state and BCM error state.
+Keep the coherent buffers managed for the device lifetime so a timed-out
+descriptor is never raced by PIO identification or freed memory.
+
+Accept only the confirmed Micron prefix and retain the result for
+comparison with the later PIO READID. Any transport failure reuses the
+existing probe gate, leaving the driver bound while skipping NAND-core
+identification.
+
+This remains probe-only. It does not read pages or OOB, enable ECC or the
+randomizer, register an MTD, erase, or program NAND.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 294 ++++++++++++++++++++++++++++
+ 1 file changed, 294 insertions(+)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+index 6a22b4f..e7f7889 100644
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -221,6 +221,19 @@
+ #define BERLIN2CD_PB_DHUB_CMD_INTERRUPT	BIT(28)
+ #define BERLIN2CD_PB_DHUB_CMD_SIZE	4
+ #define BERLIN2CD_PB_BCM_NULL		0x0000000F
++#define BERLIN2CD_PB_BCM_WCMD		(3U << 28)
++#define BERLIN2CD_PB_BCM_WDAT		(5U << 28)
++#define BERLIN2CD_PB_BCM_SEMA		(6U << 28)
++#define BERLIN2CD_PB_BCM_SEMA_CCHK(id)	(((id) & 0x1f) << 15)
++#define BERLIN2CD_PB_BCM_WCMD_UPD(id)	(((id) & 0x1f) << 21)
++#define BERLIN2CD_PB_BCM_WDAT_DWORD	(2U << 16)
++#define BERLIN2CD_PB_BCM_WDAT_LAST	BIT(19)
++#define BERLIN2CD_PB_NFC_COMMAND_SEMA	12
++#define BERLIN2CD_PB_NFC_DATA_SEMA	13
++#define BERLIN2CD_PB_NFC_COMPLETE_SEMA	24
++#define BERLIN2CD_PB_READID_LEN		8
++#define BERLIN2CD_PB_READID_PREFIX_LEN	4
++#define BERLIN2CD_PB_READID_WORDS	16
+ 
+ /* NAND controller status register */
+ #define NDSR			0x14
+@@ -466,6 +479,8 @@
+  *			this NAND controller
+  * @selected_chip:	Currently selected target chip
+  * @caps:		NAND controller capabilities for each compatible string
++ * @pbridge_readid:	Identification bytes read through Berlin pBridge
++ * @pbridge_readid_valid: pBridge identification completed successfully
+  * @use_dma:		Whetner DMA is used
+  * @dma_chan:		DMA channel (NFCv1 only)
+  * @dma_buf:		32-bit aligned buffer for DMA transfers (NFCv1 only)
+@@ -483,6 +498,8 @@
+ 	struct list_head chips;
+ 	struct nand_chip *selected_chip;
+ 	const struct marvell_nfc_caps *caps;
++	u8 pbridge_readid[BERLIN2CD_PB_READID_LEN];
++	bool pbridge_readid_valid;
+ 
+ 	/* DMA (NFCv1 only) */
+ 	bool use_dma;
+@@ -1355,6 +1372,265 @@
+ 	return true;
+ }
+ 
++static int
++berlin2cd_require_empty_semaphore(struct marvell_nfc *nfc, u8 id,
++				  const char *name)
++{
++	u32 producer = 0, consumer = 0;
++	int ret;
++
++	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_DHUB_SEMA_QUERY,
++				       id, 0, &producer, &consumer);
++	if (ret)
++		dev_err(nfc->dev,
++			"pBridge READID requires empty %s semaphore %u: producer=%u/%u consumer=%u/%u\n",
++			name, id, producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16);
++
++	return ret;
++}
++
++static bool
++marvell_berlin2cd_test_readid_descriptor(struct marvell_nfc *nfc)
++{
++	static const u8 expected_prefix[BERLIN2CD_PB_READID_PREFIX_LEN] = {
++		0x2c, 0x68, 0x04, 0x4a
++	};
++	const u8 command_sema = BERLIN2CD_PB_NFC_COMMAND_SEMA;
++	const u8 complete_sema = BERLIN2CD_PB_NFC_COMPLETE_SEMA;
++	const u8 data_sema = BERLIN2CD_PB_NFC_DATA_SEMA;
++	const u16 descriptor_size =
++		sizeof(__le32) * BERLIN2CD_PB_READID_WORDS;
++	struct platform_device *pdev = to_platform_device(nfc->dev);
++	void __iomem *regs = nfc->pbridge_regs;
++	struct resource *nfc_resource;
++	dma_addr_t descriptor_dma = 0, id_dma = 0;
++	phys_addr_t nfc_phys;
++	__le32 *descriptor;
++	u8 *id;
++	u32 bcm_base, nfc_address;
++	u32 producer = 0, consumer = 0;
++	u32 ndcb[4], ndcr, ndsr, status;
++	u32 command;
++	unsigned int i;
++	int ret;
++
++	nfc_resource = platform_get_resource_byname(pdev, IORESOURCE_MEM, "nfc");
++	if (!nfc_resource || upper_32_bits(nfc_resource->start)) {
++		dev_err(nfc->dev,
++			"pBridge READID cannot resolve the 32-bit NFC resource\n");
++		return false;
++	}
++	nfc_phys = nfc_resource->start;
++
++	bcm_base = readl_relaxed(regs + BERLIN2CD_PB_BCM_BASE);
++	if ((lower_32_bits(nfc_phys) & GENMASK(31, 28)) !=
++	    (bcm_base & GENMASK(31, 28))) {
++		dev_err(nfc->dev,
++			"pBridge READID BCM/NFC address mismatch: BCM-base=%08x NFC=%pa\n",
++			bcm_base, &nfc_phys);
++		return false;
++	}
++	nfc_address = lower_32_bits(nfc_phys) & GENMASK(27, 0);
++
++	ret = dma_set_mask_and_coherent(nfc->dev, DMA_BIT_MASK(32));
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge READID cannot set 32-bit DMA mask: %d\n", ret);
++		return false;
++	}
++
++	descriptor = dmam_alloc_coherent(nfc->dev, sizeof(*descriptor) *
++					 BERLIN2CD_PB_READID_WORDS,
++					 &descriptor_dma, GFP_KERNEL);
++	id = dmam_alloc_coherent(nfc->dev, BERLIN2CD_PB_READID_LEN,
++				 &id_dma, GFP_KERNEL);
++	if (!descriptor || !id || upper_32_bits(descriptor_dma) ||
++	    upper_32_bits(id_dma) ||
++	    !IS_ALIGNED(id_dma, BERLIN2CD_PB_READID_LEN)) {
++		dev_err(nfc->dev,
++			"pBridge READID coherent allocation failed or exceeded 32 bits: descriptor=%pad data=%pad\n",
++			&descriptor_dma, &id_dma);
++		return false;
++	}
++
++	ret = berlin2cd_require_empty_semaphore(nfc, command_sema,
++						"NFC command");
++	if (!ret)
++		ret = berlin2cd_require_empty_semaphore(nfc, data_sema,
++							"NFC data");
++	if (!ret)
++		ret = berlin2cd_require_empty_semaphore(nfc, complete_sema,
++							"NFC completion");
++	if (ret)
++		return false;
++
++	ndcb[0] = NDCB0_CMD1(NAND_CMD_READID) |
++		  NDCB0_ADDR_CYC(1) |
++		  NDCB0_CMD_TYPE(TYPE_READ_ID) |
++		  NDCB0_LEN_OVRD;
++	ndcb[1] = 0;
++	ndcb[2] = 0;
++	ndcb[3] = BERLIN2CD_PB_READID_LEN;
++
++	command =
++		BERLIN2CD_PB_BCM_SEMA_CCHK(command_sema);
++	descriptor[0] = cpu_to_le32(command);
++	descriptor[1] = cpu_to_le32(BERLIN2CD_PB_BCM_SEMA);
++	for (i = 0; i < ARRAY_SIZE(ndcb); i++) {
++		descriptor[2 + i * 2] = cpu_to_le32(ndcb[i]);
++		descriptor[3 + i * 2] =
++			cpu_to_le32(nfc_address + NDCB0);
++	}
++	command = BERLIN2CD_PB_BCM_SEMA_CCHK(data_sema);
++	descriptor[10] = cpu_to_le32(command);
++	descriptor[11] = cpu_to_le32(BERLIN2CD_PB_BCM_SEMA);
++	descriptor[12] = cpu_to_le32(lower_32_bits(id_dma));
++	command = BERLIN2CD_PB_BCM_WCMD |
++		  BERLIN2CD_PB_BCM_WCMD_UPD(complete_sema) |
++		  BERLIN2CD_PB_READID_LEN;
++	descriptor[13] = cpu_to_le32(command);
++	descriptor[14] = cpu_to_le32(BERLIN2CD_PB_BCM_WDAT_DWORD |
++				     BERLIN2CD_PB_BCM_WDAT_LAST |
++				     BERLIN2CD_PB_READID_LEN);
++	descriptor[15] = cpu_to_le32(BERLIN2CD_PB_BCM_WDAT |
++				     (nfc_address + NDDB));
++	memset(id, 0xa5, BERLIN2CD_PB_READID_LEN);
++	dma_wmb();
++
++	if (nfc->caps->fixed_ident_timings) {
++		writel_relaxed(nfc->caps->ident_ndtr0, nfc->regs + NDTR0);
++		writel_relaxed(nfc->caps->ident_ndtr1, nfc->regs + NDTR1);
++		/* Publish both timing registers before starting the NFC. */
++		wmb();
++	}
++	ndcr = readl_relaxed(nfc->regs + NDCR);
++	if (ndcr & NDCR_ND_RUN) {
++		dev_err(nfc->dev,
++			"pBridge READID requires an idle NAND controller: NDCR=%08x NDSR=%08x\n",
++			ndcr, readl_relaxed(nfc->regs + NDSR));
++		return false;
++	}
++
++	ndsr = readl_relaxed(nfc->regs + NDSR);
++	writel_relaxed(ndsr, nfc->regs + NDSR);
++	/* Valve's NFC handshake requires ND_RUN before descriptor submission. */
++	writel_relaxed(ndcr | NDCR_ND_RUN, nfc->regs + NDCR);
++	/* Start the controller before making the descriptor queue visible. */
++	wmb();
++
++	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_DHUB_SEMA_QUERY,
++				       command_sema, 1,
++				       &producer, &consumer);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge READID NFC command handshake timed out: producer=%u/%u consumer=%u/%u NDCR=%08x NDSR=%08x\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16,
++			readl_relaxed(nfc->regs + NDCR),
++			readl_relaxed(nfc->regs + NDSR));
++		writel_relaxed(ndcr, nfc->regs + NDCR);
++		writel_relaxed(readl_relaxed(nfc->regs + NDSR),
++			       nfc->regs + NDSR);
++		return false;
++	}
++
++	dev_info(nfc->dev,
++		 "pBridge READID descriptor prepared: NDCB=%08x %08x %08x %08x data=%pad command-semaphore=%u/%u\n",
++		 ndcb[0], ndcb[1], ndcb[2], ndcb[3], &id_dma,
++		 consumer & 0xffff, consumer >> 16);
++	dev_info(nfc->dev,
++		 "pBridge READID BCM words: SEMA=%08x:%08x WCMD=%08x:%08x WDAT=%08x:%08x\n",
++		 le32_to_cpu(descriptor[0]), le32_to_cpu(descriptor[1]),
++		 le32_to_cpu(descriptor[12]), le32_to_cpu(descriptor[13]),
++		 le32_to_cpu(descriptor[14]), le32_to_cpu(descriptor[15]));
++
++	ret = marvell_berlin2cd_submit_test_descriptor(nfc, descriptor_dma,
++						       descriptor_size,
++						       "READID");
++	if (ret)
++		return false;
++
++	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_DHUB_SEMA_QUERY,
++				       complete_sema, 1,
++				       &producer, &consumer);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge READID data completion timed out: producer=%u/%u consumer=%u/%u NDCR=%08x NDSR=%08x\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16,
++			readl_relaxed(nfc->regs + NDCR),
++			readl_relaxed(nfc->regs + NDSR));
++		return false;
++	}
++
++	dma_rmb();
++	memcpy(nfc->pbridge_readid, id, BERLIN2CD_PB_READID_LEN);
++	command = complete_sema |
++		  (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
++	writel(command, regs + BERLIN2CD_PB_DHUB_SEMA_POP);
++	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_DHUB_SEMA_QUERY,
++				       complete_sema, 0,
++				       &producer, &consumer);
++	berlin2cd_clear_semaphore_events(regs,
++					 BERLIN2CD_PB_DHUB_SEMA_EMPTY,
++					 BERLIN2CD_PB_DHUB_SEMA_FULL,
++					 complete_sema);
++	if (ret) {
++		dev_err(nfc->dev,
++			"pBridge READID data completion pop timed out: producer=%u/%u consumer=%u/%u\n",
++			producer & 0xffff, producer >> 16,
++			consumer & 0xffff, consumer >> 16);
++		return false;
++	}
++
++	ret = readl_relaxed_poll_timeout(nfc->regs + NDCR, status,
++					 !(status & NDCR_ND_RUN), 1,
++					 BERLIN2CD_PB_INIT_TIMEOUT_US);
++	ndsr = readl_relaxed(nfc->regs + NDSR);
++	if (ret || !(ndsr & NDSR_CMDD(0))) {
++		dev_err(nfc->dev,
++			"pBridge READID NAND completion failed: NDCR=%08x NDSR=%08x\n",
++			status, ndsr);
++		return false;
++	}
++
++	status = readl_relaxed(regs + BERLIN2CD_PB_DHUB_BUSY) |
++		 readl_relaxed(regs + BERLIN2CD_PB_DHUB_PENDING) |
++		 readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY);
++	ret = berlin2cd_require_empty_semaphore(nfc, command_sema,
++						"NFC command");
++	if (!ret)
++		ret = berlin2cd_require_empty_semaphore(nfc, data_sema,
++							"NFC data");
++	if (status || readl_relaxed(regs + BERLIN2CD_PB_BCM_ERROR) || ret) {
++		dev_err(nfc->dev,
++			"pBridge READID final transport state is not idle: dHub-busy=%08x dHub-pending=%08x HBO-busy=%08x BCM-error=%08x\n",
++			readl_relaxed(regs + BERLIN2CD_PB_DHUB_BUSY),
++			readl_relaxed(regs + BERLIN2CD_PB_DHUB_PENDING),
++			readl_relaxed(regs + BERLIN2CD_PB_HBO_BUSY),
++			readl_relaxed(regs + BERLIN2CD_PB_BCM_ERROR));
++		return false;
++	}
++
++	writel_relaxed(ndsr, nfc->regs + NDSR);
++	if (memcmp(nfc->pbridge_readid, expected_prefix,
++		   BERLIN2CD_PB_READID_PREFIX_LEN)) {
++		dev_err(nfc->dev, "pBridge READID returned unexpected data: %*ph\n",
++			BERLIN2CD_PB_READID_LEN, nfc->pbridge_readid);
++		return false;
++	}
++
++	nfc->pbridge_readid_valid = true;
++	dev_info(nfc->dev,
++		 "pBridge READID data (%u bytes): %*ph; final NDCR=%08x NDSR=%08x\n",
++		 BERLIN2CD_PB_READID_LEN, BERLIN2CD_PB_READID_LEN,
++		 nfc->pbridge_readid, readl_relaxed(nfc->regs + NDCR),
++		 readl_relaxed(nfc->regs + NDSR));
++
++	return true;
++}
++
+ static bool marvell_berlin2cd_init_pbridge(struct marvell_nfc *nfc)
+ {
+ 	void __iomem *regs = nfc->pbridge_regs;
+@@ -3246,6 +3522,20 @@
+ 		id = data_instr->ctx.data.buf.in + data_off;
+ 		dev_info(nfc->dev, "READID data (%u bytes): %*ph\n",
+ 			 data_len, (int)min_t(unsigned int, data_len, 8), id);
++		if (nfc->pbridge_readid_valid &&
++		    data_len == BERLIN2CD_PB_READID_LEN) {
++			if (memcmp(nfc->pbridge_readid, id,
++				   BERLIN2CD_PB_READID_PREFIX_LEN))
++				dev_err(nfc->dev,
++					"pBridge/PIO READID prefix mismatch: pBridge=%*ph PIO=%*ph\n",
++					BERLIN2CD_PB_READID_PREFIX_LEN,
++					nfc->pbridge_readid,
++					BERLIN2CD_PB_READID_PREFIX_LEN, id);
++			else
++				dev_info(nfc->dev,
++					 "pBridge/PIO READID prefixes match: %*ph\n",
++					 BERLIN2CD_PB_READID_PREFIX_LEN, id);
++		}
+ 	}
+ 
+ 	ret = marvell_nfc_wait_cmdd(chip);
+@@ -4399,6 +4689,10 @@
+ 
+ 	platform_set_drvdata(pdev, nfc);
+ 
++	if (nfc->caps->probe_only && pbridge_ready)
++		pbridge_ready =
++			marvell_berlin2cd_test_readid_descriptor(nfc);
++
+ 	if (nfc->caps->probe_only && !pbridge_ready) {
+ 		dev_err(dev,
+ 			"probe-only NAND identification skipped after failed pBridge transport diagnostic\n");
