@@ -419,7 +419,7 @@ Expected success is:
 
 ```text
 pBridge submitting NULL descriptor: dma=... descriptor=0000000f queue=6 slot=0 command=10000004:...
-pBridge NULL descriptor completed: dma=... queue producer=0/1 consumer=0/1 semaphore producer=1/0 consumer=1/0 events empty=1 full=1
+pBridge NULL descriptor completed: dma=... queue producer=0/1 consumer=0/1 semaphore producer=0/0 consumer=1/0 events empty=1 full=1
 pBridge coherent NULL descriptor test passed without NAND access
 ```
 
@@ -429,6 +429,46 @@ through 0. The dHub command is still one 64-bit queue entry and requests a
 four-byte transfer. The test runs only if patch `0017`'s disabled-queue test
 passes, uses bounded polling, never accesses NAND media and leaves MTD
 registration disabled.
+
+Hardware running patch `0018` produced all three success messages, returned
+both queue 6 pointers at slot one with zero queued entries, asserted the
+completion semaphore's full condition, and left `BCM-error`, all busy bits and
+the NAND registers clear or unchanged. The completion semaphore's producer
+query remained at count/pointer `0/0` while its consumer query reported
+`1/0`; this is the observed dHub-generated completion representation, not a
+missing completion. Popping it returned the consumer count to zero. PIO
+READID and both ONFI CRCs remained valid afterward.
+
+Patch `0019-mtd-nand-test-berlin2cd-cfgw-descriptor.patch` validates the first
+peripheral instruction before combining it with NAND request semaphores. It
+uses one eight-byte `CFGW` descriptor to toggle `NDTR0` bit zero while the NFC
+is idle, verifies that `NDCR`, `NDSR`, and `NDTR1` did not change, and submits
+the same descriptor again to restore the original `NDTR0`. The address is
+derived from the NFC platform resource and checked against pBridge's
+`BCM-base`; it is not a duplicated physical-address constant.
+
+The shared submit helper changes patch `0019`'s NULL submission message to
+`pBridge submitting NULL descriptor: dma=... size=4 ...`; the descriptor
+contents remain `0x0000000f`.
+
+Expected success after the patch `0018` messages is:
+
+```text
+pBridge submitting CFGW timing-test descriptor: dma=... size=8 queue=6 slot=1 command=10000008:...
+pBridge CFGW timing-test descriptor completed: ... queue producer=0/0 consumer=0/0 ...
+pBridge CFGW timing test observed NDTR0 transition: 84840a12 -> 84840a13
+pBridge submitting CFGW timing-restore descriptor: dma=... size=8 queue=6 slot=0 command=10000008:...
+pBridge CFGW timing-restore descriptor completed: ... queue producer=0/1 consumer=0/1 ...
+pBridge reversible CFGW register test passed without a NAND command
+```
+
+This is still a controller-register transport test. It does not set `ND_RUN`,
+write an NDCB register, issue a NAND command, access NAND data or register an
+MTD. If the pBridge restore cannot be submitted after an idle failure, the
+driver restores `NDTR0` through the CPU. If any transport diagnostic fails,
+the driver remains bound with its clocks and IRQ available for inspection but
+skips all subsequent PIO NAND identification, avoiding a race with a late
+descriptor.
 
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
@@ -443,8 +483,8 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0018` and verify the coherent BCM `NULL` descriptor completes
-   without changing NAND registers.
+1. Boot patch `0019` and verify both reversible `CFGW` descriptors complete
+   without changing any register except the temporary `NDTR0` bit.
 2. Port the first pBridge NAND descriptor with bounded polling, initially
    executing only a read-only READID transfer.
 3. Implement repeated raw page reads with BCH disabled and explicitly test

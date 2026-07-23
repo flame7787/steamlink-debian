@@ -62,7 +62,7 @@ Before submission:
 2. Require queue 6 and channel semaphore 3 counts to be zero.
 3. Clear their stale full-condition bits and record the empty conditions.
 4. Require `BCM-error=0`.
-5. Verify the coherent address fits in 32 bits and is 8-byte aligned.
+5. Verify the coherent address fits in 32 bits and is 4-byte aligned.
 
 Submit by writing the two command words to queue 6's current producer slot,
 publishing them with `dma_wmb()`, and pushing one token to the HBO SemaHub.
@@ -85,10 +85,50 @@ descriptor uses managed coherent memory so its address remains valid if the
 engine completes late. Keep MTD registration disabled and reboot into the
 previous image if the engine remains active.
 
+Hardware running patch `0018` completed the NULL descriptor repeatably. Queue
+6 producer and consumer pointers advanced from zero to one, every engine
+returned idle, `BCM-error` stayed zero and the NAND register snapshot was
+unchanged. The completion semaphore's consumer query reached count one and
+the full condition asserted, while its producer query stayed at zero. This is
+the stable hardware representation for a dHub-generated channel completion;
+the consumer count and full event are therefore authoritative.
+
+## Milestone 1b: reversible CFGW descriptor
+
+Before issuing the multi-instruction READID function, validate BCM peripheral
+addressing and the generated `CFGW` encoding in isolation. A `CFGW` is two
+little-endian words:
+
+```text
+word 0: 32-bit value to write
+word 1 bits 27:0: low 28 bits of the peripheral address
+word 1 bits 31:28: CFGW header 0
+```
+
+Resolve the NFC physical base from its named platform resource. Require its
+top nibble to match `BCM_base`, then encode `NFC_base + NDTR0` in the low 28
+bits. Do not hard-code the NFC physical address in the descriptor builder.
+
+With the controller idle, snapshot `NDCR`, `NDSR`, `NDTR0`, and `NDTR1`.
+Submit an eight-byte descriptor that changes only bit zero of `NDTR0`, verify
+the exact transition, then reuse the descriptor to restore the snapshot and
+verify all four registers. The bit changes the inactive controller's timing
+value only; neither descriptor sets `ND_RUN`, writes an NDCB register or
+accesses NAND.
+
+Each submission uses the bounded Milestone 1 transport checks. Queue 6 starts
+at the current producer slot, so the first `CFGW` wraps both pointers from one
+to zero and the restore advances them back to one. On a failed restore, use a
+CPU register write only if all pBridge engines have returned idle. If any
+transport milestone fails, keep the probe-only platform driver bound for
+diagnostics but skip PIO NAND identification so a late descriptor cannot race
+with a NAND command.
+
 ## Milestone 2: read-only READID descriptor
 
 Only after the NULL descriptor completes repeatably should channel 3 execute a
-BCM function that accesses NAND. Valve's READID function is seven instructions:
+BCM function that accesses NAND. Valve's original READID function is seven
+instructions:
 
 1. `SEMA`: wait as consumer on semaphore 12 (`dHub_NFCCmd`).
 2. `CFGW`: write READID `NDCB0`.
@@ -101,8 +141,9 @@ BCM function that accesses NAND. Valve's READID function is seven instructions:
 
 Do not copy Valve's READID command word verbatim. Build the four NDCB words
 with the modern driver's already validated NFCv1 parser, including `LEN_OVRD`
-and `NDCB3=8` when required. Compare the DMA result against a PIO READID in the
-same boot and require two matching `2c 68 04 4a` prefixes.
+and `NDCB3=8`. This requires a fourth `CFGW`, making the modern descriptor
+eight instructions. Compare the DMA result against a PIO READID in the same
+boot and require two matching `2c 68 04 4a` prefixes.
 
 The first READID implementation remains probe-only:
 
