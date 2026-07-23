@@ -379,6 +379,31 @@ depth was not accepted or the HBO full/query semantics differ from the common
 SemaHub. If counts become one but `full=1`, retain the dedicated warning: the
 query path works, but the full-condition behavior needs separate handling.
 
+Hardware running patch `0016` reported `producer=0/1 consumer=0/1` in both the
+immediate and final samples, with `full=0`. Compared with patch `0015`, changing
+the depth from one to two changed the full condition exactly as expected. Both
+pointers also advanced from zero to one. The HBO therefore accepted the depth
+and PUSH; matching advanced pointers with zero counts indicate that a consumer
+also performed a POP before the first CPU query.
+
+Patch `0017-mtd-nand-test-disabled-berlin2cd-hbo-queue.patch` leaves FIFO
+`START=0` after configuring queue 7. It exercises only the queue's SemaHub and
+records channel 3 state before, immediately after, and at the end of the poll.
+Expected retained-token output is:
+
+```text
+pBridge disabled queue retained push at depth 2: first producer=1/1 consumer=1/0; final producer=1/1 consumer=1/0 states=... events empty=... full=0 data=a5c35a3c:534c5042
+pBridge internal TCM/FIFO test passed: queue=7 depth=2 offset=0440
+```
+
+If the disabled queue retains the token, FIFO `START=1` allowed the unexpected
+consumer and descriptor work can use the normal producer/consumer protocol. If
+both pointers again advance to one with zero counts, consumption is independent
+of the FIFO enable and the next diagnostic must isolate the HBO SemaHub from
+the dHub/2D channel block. If neither pointer advances, HBO ignores PUSH while
+the FIFO is disabled and the test must instead hold the associated channel in
+a stronger reset state.
+
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
 without an Oops or timeout reaching the persistent journal. Patch `0008`
@@ -392,9 +417,10 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0016` and compare the depth-two HBO count and full-condition
-   behavior with the passing depth-one dHub semaphore.
-2. Resolve the failing HBO FiFoCtl layer before porting pBridge descriptors.
+1. Boot patch `0017` and determine whether FIFO `START=0` prevents the
+   observed immediate HBO consumer transition.
+2. Resolve or account for the unexpected HBO consumer before porting pBridge
+   descriptors.
 3. Port the pBridge descriptor primitives with bounded polling, but
    initially execute only a read-only READID transfer.
 4. Implement repeated raw page reads with BCH disabled and explicitly test

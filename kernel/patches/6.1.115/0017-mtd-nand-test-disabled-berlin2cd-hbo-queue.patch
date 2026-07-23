@@ -1,0 +1,104 @@
+The depth-two HBO test advances both producer and consumer pointers from
+zero to one while both counts return to zero.  The full condition stays
+clear.  The queue therefore accepts its configuration and PUSH, but a
+consumer removes the token before the first CPU query.
+
+Keep queue 7 disabled after clearing and configuring it, then repeat the
+depth-two SemaHub PUSH/POP test.  The FIFO data path and channel should be
+unable to consume a token while FIFO START is zero.  Record channel 3's raw
+state before PUSH, immediately afterward, and after the bounded poll.
+
+Restore Valve's queue depth and enable state on every completed cleanup
+path.  No descriptor is submitted and no NAND command or media data is
+accessed.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -753,12 +753,16 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 		BERLIN2CD_PB_TEST_QUEUE * BERLIN2CD_PB_SEMA_STRIDE;
+ 	void __iomem *channel = regs + BERLIN2CD_PB_DHUB_CHANNEL_CFG +
+ 		BERLIN2CD_PB_TEST_CHANNEL * BERLIN2CD_PB_CHANNEL_STRIDE;
++	void __iomem *channel_state = regs +
++		BERLIN2CD_PB_DHUB_CHANNEL_STATE +
++		BERLIN2CD_PB_TEST_CHANNEL * sizeof(u32);
+ 	void __iomem *tcm = regs + BERLIN2CD_PB_TEST_TCM_OFFSET;
+ 	u32 command = BERLIN2CD_PB_TEST_QUEUE |
+ 		      (1 << BERLIN2CD_PB_SEMA_DELTA_SHIFT);
+ 	u32 saved_low, saved_high, actual_low, actual_high;
+ 	u32 producer = 0, consumer = 0, status;
+ 	u32 first_producer = 0, first_consumer = 0;
++	u32 state_before, first_state, final_state;
+ 	u32 empty_event = 0, full_event = 0;
+ 	bool passed = false, pushed = false;
+ 	int cleanup_ret = 0;
+@@ -811,8 +815,11 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 
+ 	writel_relaxed(BERLIN2CD_PB_TEST_TCM_OFFSET, fifo);
+ 	writel_relaxed(BERLIN2CD_PB_TEST_QUEUE_DEPTH, sema);
+-	writel_relaxed(1, fifo + BERLIN2CD_PB_FIFO_START);
+-	/* Publish queue configuration before querying it. */
++	/*
++	 * Keep the FIFO disabled so only its SemaHub can observe the push.
++	 * This distinguishes an HBO counter problem from an unexpected dHub
++	 * consumer.
++	 */
+ 	wmb();
+ 
+ 	ret = berlin2cd_wait_test_queue(nfc, 0, &producer, &consumer);
+@@ -823,6 +830,7 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 			consumer & 0xffff, consumer >> 16);
+ 		goto disable;
+ 	}
++	state_before = readl_relaxed(channel_state);
+ 
+ 	if (!berlin2cd_clear_full_event(regs,
+ 					BERLIN2CD_PB_HBO_SEMA_FULL,
+@@ -856,7 +864,9 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 	first_producer = marvell_berlin2cd_pbridge_sema_query(regs,
+ 							      BERLIN2CD_PB_HBO_SEMA_QUERY,
+ 							      BERLIN2CD_PB_TEST_QUEUE, false);
++	first_state = readl_relaxed(channel_state);
+ 	ret = berlin2cd_wait_test_queue(nfc, 1, &producer, &consumer);
++	final_state = readl_relaxed(channel_state);
+ 	berlin2cd_read_semaphore_events(regs,
+ 					BERLIN2CD_PB_HBO_SEMA_EMPTY,
+ 					BERLIN2CD_PB_HBO_SEMA_FULL,
+@@ -864,12 +874,14 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 					&empty_event, &full_event);
+ 	if (ret) {
+ 		dev_err(nfc->dev,
+-			"pBridge internal queue consumer did not observe push at depth %u: first producer=%u/%u consumer=%u/%u; final producer=%u/%u consumer=%u/%u events empty=%u full=%u\n",
++			"pBridge disabled queue did not retain push at depth %u: first producer=%u/%u consumer=%u/%u; final producer=%u/%u consumer=%u/%u states=%04x>%04x>%04x events empty=%u full=%u\n",
+ 			BERLIN2CD_PB_TEST_QUEUE_DEPTH,
+ 			first_producer & 0xffff, first_producer >> 16,
+ 			first_consumer & 0xffff, first_consumer >> 16,
+ 			producer & 0xffff, producer >> 16,
+ 			consumer & 0xffff, consumer >> 16,
++			state_before & 0xffff, first_state & 0xffff,
++			final_state & 0xffff,
+ 			empty_event, full_event);
+ 		goto disable;
+ 	}
+@@ -879,12 +891,14 @@ static void marvell_berlin2cd_test_pbridge(struct marvell_nfc *nfc)
+ 			 BERLIN2CD_PB_TEST_QUEUE_DEPTH);
+ 
+ 	dev_info(nfc->dev,
+-		 "pBridge internal queue after push at depth %u: first producer=%u/%u consumer=%u/%u; final producer=%u/%u consumer=%u/%u events empty=%u full=%u data=%08x:%08x\n",
++		 "pBridge disabled queue retained push at depth %u: first producer=%u/%u consumer=%u/%u; final producer=%u/%u consumer=%u/%u states=%04x>%04x>%04x events empty=%u full=%u data=%08x:%08x\n",
+ 		 BERLIN2CD_PB_TEST_QUEUE_DEPTH,
+ 		 first_producer & 0xffff, first_producer >> 16,
+ 		 first_consumer & 0xffff, first_consumer >> 16,
+ 		 producer & 0xffff, producer >> 16,
+ 		 consumer & 0xffff, consumer >> 16,
++		 state_before & 0xffff, first_state & 0xffff,
++		 final_state & 0xffff,
+ 		 empty_event, full_event,
+ 		 readl_relaxed(tcm + sizeof(u32)), readl_relaxed(tcm));
+ 
+-- 
+2.50.1
