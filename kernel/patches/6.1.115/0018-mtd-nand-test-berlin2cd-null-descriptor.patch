@@ -1,6 +1,3 @@
-From: Steam Link Debian maintainers
-Subject: [PATCH] mtd: nand: test Berlin2CD coherent NULL descriptor
-
 Hardware testing confirms that Berlin2CD's depth-two HBO queue retains a
 token while disabled and consumes it normally while enabled.  Exercise the
 next transport layer without touching the NAND controller or flash.

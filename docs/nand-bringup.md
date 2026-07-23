@@ -470,6 +470,25 @@ the driver remains bound with its clocks and IRQ available for inspection but
 skips all subsequent PIO NAND identification, avoiding a race with a late
 descriptor.
 
+The first patch `0019` hardware run stopped before submitting `CFGW`:
+
+```text
+pBridge CFGW timing-test descriptor completion semaphore is not empty: producer=1/0 consumer=0/0
+probe-only NAND identification skipped after failed pBridge transport diagnostic
+```
+
+This is the complementary half of the completion behavior observed with
+patch `0018`. The consumer query reached one when dHub completed the NULL
+descriptor, then returned to zero after POP; the producer query changed from
+zero to one after that POP. The consumer count is therefore the authoritative
+occupancy value for dHub-generated completions.
+
+Patch `0020-mtd-nand-trust-berlin2cd-completion-consumer.patch` removes the
+contradictory producer-count prerequisite. The bounded wait already polls the
+consumer count, and both values remain in timeout diagnostics. The failed run
+issued no `CFGW` or NAND command, and the fail-safe correctly left the driver
+bound while skipping PIO identification.
+
 Do not hot-unbind the experimental controller. Writing the Berlin2CD platform
 device name to the driver's sysfs `unbind` file hard-locked the Steam Link
 without an Oops or timeout reaching the persistent journal. Patch `0008`
@@ -483,8 +502,8 @@ NAND cleanup assumes that later manufacturer initialization already happened.
 
 ## Next implementation stages
 
-1. Boot patch `0019` and verify both reversible `CFGW` descriptors complete
-   without changing any register except the temporary `NDTR0` bit.
+1. Boot through patch `0020` and verify both reversible `CFGW` descriptors
+   complete without changing any register except the temporary `NDTR0` bit.
 2. Port the first pBridge NAND descriptor with bounded polling, initially
    executing only a read-only READID transfer.
 3. Implement repeated raw page reads with BCH disabled and explicitly test

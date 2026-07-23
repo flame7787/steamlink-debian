@@ -124,6 +124,14 @@ transport milestone fails, keep the probe-only platform driver bound for
 diagnostics but skip PIO NAND identification so a late descriptor cannot race
 with a NAND command.
 
+The first `0019` hardware run did not submit the `CFGW`: after the NULL
+completion was popped, semaphore 3 reported producer count/pointer `1/0` and
+consumer count/pointer `0/0`. The fail-safe then skipped PIO identification as
+designed. This proves the producer and consumer query windows are not
+interchangeable for a dHub-generated completion. Patch `0020` accepts zero
+consumer occupancy regardless of the residual producer count; completion and
+POP waits continue to use only the consumer query.
+
 ## Milestone 2: read-only READID descriptor
 
 Only after the NULL descriptor completes repeatably should channel 3 execute a

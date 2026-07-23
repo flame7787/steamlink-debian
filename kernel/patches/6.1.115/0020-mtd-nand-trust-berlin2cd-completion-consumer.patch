@@ -1,0 +1,29 @@
+Hardware running the coherent NULL descriptor test reports completion
+through the dHub semaphore's consumer query and full condition. After the
+completion is popped, the consumer count correctly returns to zero but the
+producer query reports count one.
+
+The next descriptor currently rejects that asymmetric but empty state. Use
+the consumer count already polled by berlin2cd_wait_semaphore() as the
+authoritative empty test. Retain both query values in failure diagnostics.
+
+This changes only transport bookkeeping. It does not submit an additional
+descriptor or access NAND media.
+
+---
+ drivers/mtd/nand/raw/marvell_nand.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+index dc50b03..6a22b4f 100644
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -1035,7 +1035,7 @@ marvell_berlin2cd_submit_test_descriptor(struct marvell_nfc *nfc,
+ 	ret = berlin2cd_wait_semaphore(nfc, BERLIN2CD_PB_DHUB_SEMA_QUERY,
+ 				       BERLIN2CD_PB_TEST_COMPLETION_SEMA, 0,
+ 				       &sema_producer, &sema_consumer);
+-	if (ret || (sema_producer & 0xffff)) {
++	if (ret) {
+ 		dev_err(nfc->dev,
+ 			"pBridge %s descriptor completion semaphore is not empty: producer=%u/%u consumer=%u/%u\n",
+ 			label,
