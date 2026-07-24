@@ -1,3 +1,6 @@
+## BRICK WARNING
+I bricked my Steam Link with this branch, I wouldn't recommend trying it :D
+
 ## What is this fork?
 
 The build uses Debian 13 and Linux 6.1.115. Docker is included in the generated image. The kernel config adds Linux namespaces, cgroups, seccomp, overlayfs, veth/bridge networking, nftables, and iptables, required for Docker.
